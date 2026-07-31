@@ -240,7 +240,10 @@ impl eframe::App for Pm2App {
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(ref path) = self.current_file {
-                    ui.label(RichText::new(format!("File: {}", path.display())).size(11.0).color(Color32::from_rgb(148, 163, 184)));
+                    let display_str = format!("File: {}", path.display());
+                    let label = egui::Label::new(RichText::new(&display_str).size(11.0).color(Color32::from_rgb(148, 163, 184)))
+                        .truncate();
+                    ui.add(label).on_hover_text(path.to_string_lossy());
                 } else {
                     ui.label(RichText::new("No file loaded").size(11.0).color(Color32::from_rgb(148, 163, 184)));
                 }
@@ -274,7 +277,7 @@ impl eframe::App for Pm2App {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Search:").strong().color(Color32::WHITE));
-                    if ui.add(egui::TextEdit::singleline(&mut self.filters.search_query).hint_text("Filter path...")).changed() {
+                    if ui.add(egui::TextEdit::singleline(&mut self.filters.search_query).desired_width(220.0).hint_text("Filter path...")).changed() {
                         filter_changed = true;
                     }
 

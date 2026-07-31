@@ -2,8 +2,13 @@ use crate::core::models::LogAnalysisSummary;
 use egui::{Align, Color32, CornerRadius, Layout, RichText, Sense, StrokeKind, Ui, UiBuilder, Vec2};
 
 pub fn render_kpi_dashboard(ui: &mut Ui, summary: &LogAnalysisSummary) {
+    let card_count = 5.0;
+    let spacing = 12.0;
+    let total_spacing = spacing * (card_count - 1.0);
+    let card_width = ((ui.available_width() - total_spacing) / card_count).max(160.0);
+
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing = Vec2::new(12.0, 0.0);
+        ui.spacing_mut().item_spacing = Vec2::new(spacing, 0.0);
 
         let format_bytes = |b: u64| -> String {
             if b >= 1024 * 1024 * 1024 {
@@ -19,6 +24,7 @@ pub fn render_kpi_dashboard(ui: &mut Ui, summary: &LogAnalysisSummary) {
 
         kpi_card(
             ui,
+            card_width,
             "Total Ingested",
             &format_bytes(summary.total_file_size_bytes),
             &format!("{} lines parsed in {} ms", summary.total_lines_parsed, summary.parse_duration_ms),
@@ -27,6 +33,7 @@ pub fn render_kpi_dashboard(ui: &mut Ui, summary: &LogAnalysisSummary) {
 
         kpi_card(
             ui,
+            card_width,
             "Matched HTTP Requests",
             &format!("{}", summary.matched_http_requests),
             &format!("{} unique endpoints", summary.endpoints.len()),
@@ -43,6 +50,7 @@ pub fn render_kpi_dashboard(ui: &mut Ui, summary: &LogAnalysisSummary) {
 
         kpi_card(
             ui,
+            card_width,
             "Error Rate",
             &format!("{:.2}%", summary.overall_error_rate),
             &format!("{} error responses", summary.overall_error_count),
@@ -51,6 +59,7 @@ pub fn render_kpi_dashboard(ui: &mut Ui, summary: &LogAnalysisSummary) {
 
         kpi_card(
             ui,
+            card_width,
             "p95 Latency",
             &format!("{:.1} ms", summary.overall_p95_ms),
             &format!("p50: {:.1} ms | p99: {:.1} ms", summary.overall_p50_ms, summary.overall_p99_ms),
@@ -59,6 +68,7 @@ pub fn render_kpi_dashboard(ui: &mut Ui, summary: &LogAnalysisSummary) {
 
         kpi_card(
             ui,
+            card_width,
             "Cron Executions",
             &format!("{}", summary.total_cron_events),
             &format!("{} active cron jobs", summary.cron_jobs.len()),
@@ -67,8 +77,7 @@ pub fn render_kpi_dashboard(ui: &mut Ui, summary: &LogAnalysisSummary) {
     });
 }
 
-fn kpi_card(ui: &mut Ui, title: &str, value: &str, subtitle: &str, accent_color: Color32) {
-    let card_width = 200.0;
+fn kpi_card(ui: &mut Ui, card_width: f32, title: &str, value: &str, subtitle: &str, accent_color: Color32) {
     let card_height = 80.0;
 
     let (rect, _response) = ui.allocate_exact_size(Vec2::new(card_width, card_height), Sense::hover());
@@ -86,9 +95,9 @@ fn kpi_card(ui: &mut Ui, title: &str, value: &str, subtitle: &str, accent_color:
             .max_rect(rect.shrink2(Vec2::new(12.0, 10.0)))
             .layout(Layout::top_down(Align::Min)),
         |child_ui| {
-            child_ui.label(RichText::new(title).size(12.0).color(Color32::from_rgb(148, 163, 184)));
-            child_ui.label(RichText::new(value).size(20.0).strong().color(Color32::WHITE));
-            child_ui.label(RichText::new(subtitle).size(11.0).color(Color32::from_rgb(203, 213, 225)));
+            child_ui.add(egui::Label::new(RichText::new(title).size(12.0).color(Color32::from_rgb(148, 163, 184))).truncate());
+            child_ui.add(egui::Label::new(RichText::new(value).size(20.0).strong().color(Color32::WHITE)).truncate());
+            child_ui.add(egui::Label::new(RichText::new(subtitle).size(11.0).color(Color32::from_rgb(203, 213, 225))).truncate());
         },
     );
 }

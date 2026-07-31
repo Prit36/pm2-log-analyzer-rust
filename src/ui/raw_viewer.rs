@@ -1,4 +1,4 @@
-use egui::{Color32, RichText, ScrollArea, Ui, Vec2};
+use egui::{Color32, RichText, ScrollArea, Ui};
 
 pub fn render_raw_viewer(ui: &mut Ui, samples: &[String]) {
     if samples.is_empty() {
@@ -14,14 +14,11 @@ pub fn render_raw_viewer(ui: &mut Ui, samples: &[String]) {
     ui.add_space(8.0);
 
     let row_height = 20.0;
-    ScrollArea::vertical().show_rows(ui, row_height, samples.len(), |ui, row_range| {
+    ScrollArea::both().show_rows(ui, row_height, samples.len(), |ui, row_range| {
         for idx in row_range {
             let line = &samples[idx];
             ui.horizontal(|ui| {
-                ui.add_sized(
-                    Vec2::new( ui.available_width(), row_height),
-                    egui::Label::new(RichText::new(line).monospace().size(12.0).color(Color32::from_rgb(226, 232, 240))),
-                );
+                ui.add(egui::Label::new(RichText::new(line).monospace().size(12.0).color(Color32::from_rgb(226, 232, 240))));
             });
         }
     });
