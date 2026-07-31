@@ -99,37 +99,42 @@ impl Engine {
         }
     }
 
-    pub fn finalize_paths(&mut self) {
-        let modes = [
-            PathNormMode::Raw,
-            PathNormMode::StripQuery,
-            PathNormMode::CollapseIds,
-        ];
-        let num_paths = self.path_off.len();
-
-        for (mode_idx, &mode) in modes.iter().enumerate() {
-            let mut norm_map: FastHashMap<Vec<u8>, u32> = FastHashMap::default();
-            let mut unique_norm_paths: Vec<Vec<u8>> = Vec::new();
-            let mut raw_to_norm: Vec<u32> = Vec::with_capacity(num_paths);
-
-            for id in 0..num_paths as u32 {
-                let raw = self.path_slice(id);
-                let norm = normalize_path_bytes(raw, mode);
-                let norm_id = match norm_map.get(norm.as_ref()) {
-                    Some(&nid) => nid,
-                    None => {
-                        let nid = unique_norm_paths.len() as u32;
-                        norm_map.insert(norm.to_vec(), nid);
-                        unique_norm_paths.push(norm.to_vec());
-                        nid
-                    }
-                };
-                raw_to_norm.push(norm_id);
-            }
-
-            self.norm_maps[mode_idx] = raw_to_norm;
-            self.norm_unique_paths[mode_idx] = unique_norm_paths;
+    pub fn ensure_mode(&self, mode_idx: usize) -> (Vec<u32>, Vec<Vec<u8>>) {
+        if !self.norm_maps[mode_idx].is_empty() {
+            return (self.norm_maps[mode_idx].clone(), self.norm_unique_paths[mode_idx].clone());
         }
+        let mode = match mode_idx {
+            0 => PathNormMode::Raw,
+            1 => PathNormMode::StripQuery,
+            _ => PathNormMode::CollapseIds,
+        };
+        let num_paths = self.path_off.len();
+        let mut norm_map: FastHashMap<Vec<u8>, u32> = FastHashMap::default();
+        let mut unique_norm_paths: Vec<Vec<u8>> = Vec::new();
+        let mut raw_to_norm: Vec<u32> = Vec::with_capacity(num_paths);
+
+        for id in 0..num_paths as u32 {
+            let raw = self.path_slice(id);
+            let norm = normalize_path_bytes(raw, mode);
+            let norm_id = match norm_map.get(norm.as_ref()) {
+                Some(&nid) => nid,
+                None => {
+                    let nid = unique_norm_paths.len() as u32;
+                    norm_map.insert(norm.to_vec(), nid);
+                    unique_norm_paths.push(norm.to_vec());
+                    nid
+                }
+            };
+            raw_to_norm.push(norm_id);
+        }
+        (raw_to_norm, unique_norm_paths)
+    }
+
+    pub fn finalize_paths(&mut self) {
+        // Pre-compute only the default CollapseIds mode (index 2) at parse finish
+        let (raw_to_norm, unique_norm_paths) = self.ensure_mode(2);
+        self.norm_maps[2] = raw_to_norm;
+        self.norm_unique_paths[2] = unique_norm_paths;
     }
 
     pub fn aggregate(
@@ -144,16 +149,14 @@ impl Engine {
             PathNormMode::CollapseIds => 2,
         };
 
-        let raw_to_norm = if !self.norm_maps[mode_idx].is_empty() {
-            &self.norm_maps[mode_idx]
+        let (computed_raw_to_norm, computed_unique_paths);
+        let (raw_to_norm, unique_norm_paths) = if !self.norm_maps[mode_idx].is_empty() {
+            (&self.norm_maps[mode_idx], &self.norm_unique_paths[mode_idx])
         } else {
-            &self.norm_maps[0]
-        };
-
-        let unique_norm_paths = if !self.norm_unique_paths[mode_idx].is_empty() {
-            &self.norm_unique_paths[mode_idx]
-        } else {
-            &self.norm_unique_paths[0]
+            let (r, u) = self.ensure_mode(mode_idx);
+            computed_raw_to_norm = r;
+            computed_unique_paths = u;
+            (&computed_raw_to_norm, &computed_unique_paths)
         };
 
         let search_lower = if filters.search_query.is_empty() {
