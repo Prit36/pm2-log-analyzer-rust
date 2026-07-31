@@ -1,0 +1,5 @@
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+    "-L", "native=C:/Users/My_Home/Desktop/projects/pm2-logs/pm2-log-analyzer-rust/.cargo/lib",
+    "-C", "link-arg=-lunwind"
+]
