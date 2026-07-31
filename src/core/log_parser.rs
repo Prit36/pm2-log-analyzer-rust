@@ -98,16 +98,28 @@ fn skip_timestamp(buf: &[u8], start: usize, end: usize) -> Option<usize> {
 
 fn parse_method(buf: &[u8], mut i: usize, end: usize) -> Option<(Method, usize)> {
     i = skip_space_ansi(buf, i, end);
-    const METHODS: &[(Method, &[u8])] = &[
-        (Method::Get, b"GET"),
-        (Method::Post, b"POST"),
+    if i + 3 <= end && &buf[i..i + 3] == b"GET" {
+        let after = i + 3;
+        let next = if after < end { buf[after] } else { b' ' };
+        if next == b' ' || next == b'\t' || next == 0x1b || after >= end {
+            return Some((Method::Get, after));
+        }
+    }
+    if i + 4 <= end && &buf[i..i + 4] == b"POST" {
+        let after = i + 4;
+        let next = if after < end { buf[after] } else { b' ' };
+        if next == b' ' || next == b'\t' || next == 0x1b || after >= end {
+            return Some((Method::Post, after));
+        }
+    }
+    const OTHER_METHODS: &[(Method, &[u8])] = &[
         (Method::Put, b"PUT"),
         (Method::Head, b"HEAD"),
         (Method::Patch, b"PATCH"),
         (Method::Delete, b"DELETE"),
         (Method::Options, b"OPTIONS"),
     ];
-    for &(method, bytes) in METHODS {
+    for &(method, bytes) in OTHER_METHODS {
         if i + bytes.len() > end {
             continue;
         }

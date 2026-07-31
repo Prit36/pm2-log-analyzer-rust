@@ -1,6 +1,6 @@
 use super::log_parser::{parse_line_bytes, skip_ansi, LineKind};
 use super::models::{
-    CronStats, EndpointStats, FilterOptions, LogAnalysisSummary, Method,
+    CronStats, EndpointStats, FilterOptions, LogAnalysisSummary, Method, PathNormMode,
     StatusFamily,
 };
 use super::path_norm::normalize_path_bytes;
@@ -43,6 +43,8 @@ pub struct Engine {
     pub unmatched_count: u64,
     pub unmatched_samples: Vec<String>,
     pub cron_events: Vec<CronEvent>,
+    pub norm_maps: [Vec<u32>; 3],
+    pub norm_unique_paths: [Vec<Vec<u8>>; 3],
 }
 
 impl Engine {
@@ -97,6 +99,38 @@ impl Engine {
         }
     }
 
+    pub fn finalize_paths(&mut self) {
+        let modes = [
+            PathNormMode::Raw,
+            PathNormMode::StripQuery,
+            PathNormMode::CollapseIds,
+        ];
+        let num_paths = self.path_off.len();
+
+        for (mode_idx, &mode) in modes.iter().enumerate() {
+            let mut norm_map: FastHashMap<Vec<u8>, u32> = FastHashMap::default();
+            let mut unique_norm_paths: Vec<Vec<u8>> = Vec::new();
+            let mut raw_to_norm: Vec<u32> = Vec::with_capacity(num_paths);
+
+            for id in 0..num_paths as u32 {
+                let raw = self.path_slice(id);
+                let norm = normalize_path_bytes(raw, mode);
+                let norm_id = match norm_map.get(norm.as_ref()) {
+                    Some(&nid) => nid,
+                    None => {
+                        let nid = unique_norm_paths.len() as u32;
+                        norm_map.insert(norm.to_vec(), nid);
+                        unique_norm_paths.push(norm.to_vec());
+                        nid
+                    }
+                };
+                raw_to_norm.push(norm_id);
+            }
+
+            self.norm_maps[mode_idx] = raw_to_norm;
+            self.norm_unique_paths[mode_idx] = unique_norm_paths;
+        }
+    }
 
     pub fn aggregate(
         &self,
@@ -104,31 +138,29 @@ impl Engine {
         elapsed_ms: u64,
         filters: &FilterOptions,
     ) -> LogAnalysisSummary {
+        let mode_idx = match filters.path_norm_mode {
+            PathNormMode::Raw => 0,
+            PathNormMode::StripQuery => 1,
+            PathNormMode::CollapseIds => 2,
+        };
+
+        let raw_to_norm = if !self.norm_maps[mode_idx].is_empty() {
+            &self.norm_maps[mode_idx]
+        } else {
+            &self.norm_maps[0]
+        };
+
+        let unique_norm_paths = if !self.norm_unique_paths[mode_idx].is_empty() {
+            &self.norm_unique_paths[mode_idx]
+        } else {
+            &self.norm_unique_paths[0]
+        };
+
         let search_lower = if filters.search_query.is_empty() {
             None
         } else {
             Some(filters.search_query.to_lowercase())
         };
-
-        // 1. Map raw path IDs to unique normalized path IDs once
-        let mut norm_map: FastHashMap<Vec<u8>, u32> = FastHashMap::default();
-        let mut unique_norm_paths: Vec<Vec<u8>> = Vec::new();
-        let mut raw_to_norm: Vec<u32> = Vec::with_capacity(self.path_off.len());
-
-        for id in 0..self.path_off.len() as u32 {
-            let raw = self.path_slice(id);
-            let norm = normalize_path_bytes(raw, filters.path_norm_mode);
-            let norm_id = match norm_map.get(norm.as_ref()) {
-                Some(&nid) => nid,
-                None => {
-                    let nid = unique_norm_paths.len() as u32;
-                    norm_map.insert(norm.to_vec(), nid);
-                    unique_norm_paths.push(norm.to_vec());
-                    nid
-                }
-            };
-            raw_to_norm.push(norm_id);
-        }
 
         let num_norm_paths = unique_norm_paths.len();
 
@@ -431,7 +463,7 @@ pub fn parse_log_buffer(buffer: &[u8]) -> Engine {
     }
 
     let num_cpus = rayon::current_num_threads().max(1);
-    let chunk_size = (buffer.len() / num_cpus).max(1_024 * 1_024);
+    let chunk_size = (buffer.len() / num_cpus).max(4 * 1024 * 1024);
 
     let mut chunk_starts = Vec::with_capacity(num_cpus + 1);
     chunk_starts.push(0);
@@ -455,13 +487,15 @@ pub fn parse_log_buffer(buffer: &[u8]) -> Engine {
         .map(|w| &buffer[w[0]..w[1]])
         .collect();
 
-    chunks
+    let mut engine = chunks
         .into_par_iter()
         .map(|chunk| parse_chunk(chunk))
         .reduce(Engine::default, |mut a, b| {
             a.merge(b);
             a
-        })
+        });
+    engine.finalize_paths();
+    engine
 }
 
 fn parse_chunk(chunk: &[u8]) -> Engine {
