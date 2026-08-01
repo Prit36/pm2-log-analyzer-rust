@@ -39,7 +39,7 @@ pub struct Engine {
     pub path_bytes: Vec<u8>,
     pub path_off: Vec<u32>,
     pub path_len: Vec<u16>,
-    pub path_index: FastHashMap<Vec<u8>, u32>,
+    pub path_index: FastHashMap<u64, u32>,
     pub unmatched_count: u64,
     pub unmatched_samples: Vec<String>,
     pub cron_events: Vec<CronEvent>,
@@ -53,17 +53,21 @@ impl Engine {
     }
 
     pub fn intern_path(&mut self, path: &[u8]) -> u32 {
-        if let Some(&id) = self.path_index.get(path) {
-            return id;
+        let hash = rapidhash::rapidhash(path);
+        if let Some(&id) = self.path_index.get(&hash) {
+            if self.path_slice(id) == path {
+                return id;
+            }
         }
         let id = self.path_off.len() as u32;
         let off = self.path_bytes.len() as u32;
         self.path_bytes.extend_from_slice(path);
         self.path_off.push(off);
         self.path_len.push(path.len() as u16);
-        self.path_index.insert(path.to_vec(), id);
+        self.path_index.insert(hash, id);
         id
     }
+
 
     pub fn path_slice(&self, id: u32) -> &[u8] {
         let off = self.path_off[id as usize] as usize;
@@ -103,25 +107,43 @@ impl Engine {
         if !self.norm_maps[mode_idx].is_empty() {
             return (self.norm_maps[mode_idx].clone(), self.norm_unique_paths[mode_idx].clone());
         }
+        let num_paths = self.path_off.len();
+
+        if mode_idx == 0 {
+            let raw_to_norm: Vec<u32> = (0..num_paths as u32).collect();
+            let unique_norm_paths: Vec<Vec<u8>> = (0..num_paths as u32)
+                .into_par_iter()
+                .map(|id| self.path_slice(id).to_vec())
+                .collect();
+            return (raw_to_norm, unique_norm_paths);
+        }
+
         let mode = match mode_idx {
             0 => PathNormMode::Raw,
             1 => PathNormMode::StripQuery,
             _ => PathNormMode::CollapseIds,
         };
-        let num_paths = self.path_off.len();
+
+
+        let normalized_paths: Vec<Vec<u8>> = (0..num_paths as u32)
+            .into_par_iter()
+            .map(|id| {
+                let raw = self.path_slice(id);
+                normalize_path_bytes(raw, mode).into_owned()
+            })
+            .collect();
+
         let mut norm_map: FastHashMap<Vec<u8>, u32> = FastHashMap::default();
         let mut unique_norm_paths: Vec<Vec<u8>> = Vec::new();
         let mut raw_to_norm: Vec<u32> = Vec::with_capacity(num_paths);
 
-        for id in 0..num_paths as u32 {
-            let raw = self.path_slice(id);
-            let norm = normalize_path_bytes(raw, mode);
-            let norm_id = match norm_map.get(norm.as_ref()) {
+        for norm in normalized_paths {
+            let norm_id = match norm_map.get(&norm) {
                 Some(&nid) => nid,
                 None => {
                     let nid = unique_norm_paths.len() as u32;
-                    norm_map.insert(norm.to_vec(), nid);
-                    unique_norm_paths.push(norm.to_vec());
+                    norm_map.insert(norm.clone(), nid);
+                    unique_norm_paths.push(norm);
                     nid
                 }
             };
@@ -129,6 +151,7 @@ impl Engine {
         }
         (raw_to_norm, unique_norm_paths)
     }
+
 
     pub fn finalize_paths(&mut self) {
         // Pre-compute only the default CollapseIds mode (index 2) at parse finish
@@ -178,16 +201,13 @@ impl Engine {
             }
         }
 
-        let num_slots = num_norm_paths * 8;
-
         // 3. Parallel Rayon Chunk Aggregation over PackedEntry array
         let chunk_size = (self.entries.len() / rayon::current_num_threads().max(1)).max(50_000);
         let chunk_results: Vec<ChunkResult> = self
             .entries
             .par_chunks(chunk_size)
             .map(|chunk| {
-                let mut local_slots: Vec<Option<Box<EndpointAcc>>> = Vec::with_capacity(num_slots);
-                local_slots.resize_with(num_slots, || None);
+                let mut local_slots: FastHashMap<u32, EndpointAcc> = FastHashMap::default();
                 let mut local_sketch = RelHist::new();
                 let mut local_http_count = 0u64;
                 let mut local_error_count = 0u64;
@@ -251,26 +271,16 @@ impl Engine {
                     }
                     local_sketch.accept(entry.duration);
 
-                    let slot_idx = (norm_id as usize) * 8 + (method_u8 as usize);
-                    if slot_idx >= local_slots.len() {
-                        continue;
-                    }
-
-                    let slot = match &mut local_slots[slot_idx] {
-                        Some(s) => s,
-                        None => {
-                            local_slots[slot_idx] = Some(Box::new(EndpointAcc {
-                                total_calls: 0,
-                                error_calls: 0,
-                                total_duration_ms: 0.0,
-                                min_duration_ms: f32::MAX,
-                                max_duration_ms: f32::MIN,
-                                sketch: RelHist::new(),
-                                status_counts: HashMap::new(),
-                            }));
-                            local_slots[slot_idx].as_mut().unwrap()
-                        }
-                    };
+                    let slot_idx = (norm_id * 8) + (method_u8 as u32);
+                    let slot = local_slots.entry(slot_idx).or_insert_with(|| EndpointAcc {
+                        total_calls: 0,
+                        error_calls: 0,
+                        total_duration_ms: 0.0,
+                        min_duration_ms: f32::MAX,
+                        max_duration_ms: f32::MIN,
+                        sketch: RelHist::new(),
+                        status_counts: HashMap::new(),
+                    });
 
                     slot.total_calls += 1;
                     if entry.status >= 400 {
@@ -297,8 +307,7 @@ impl Engine {
             .collect();
 
         // 4. Reduce chunk results
-        let mut global_slots: Vec<Option<Box<EndpointAcc>>> = Vec::with_capacity(num_slots);
-        global_slots.resize_with(num_slots, || None);
+        let mut global_slots: FastHashMap<u32, EndpointAcc> = FastHashMap::default();
         let mut overall_sketch = RelHist::new();
         let mut filtered_http_count = 0u64;
         let mut filtered_error_count = 0u64;
@@ -308,31 +317,30 @@ impl Engine {
             filtered_http_count += res.http_count;
             filtered_error_count += res.error_count;
 
-            for (idx, slot) in res.slots.into_iter().enumerate() {
-                if let Some(chunk_acc) = slot {
-                    match &mut global_slots[idx] {
-                        Some(global_acc) => {
-                            global_acc.total_calls += chunk_acc.total_calls;
-                            global_acc.error_calls += chunk_acc.error_calls;
-                            global_acc.total_duration_ms += chunk_acc.total_duration_ms;
-                            if chunk_acc.min_duration_ms < global_acc.min_duration_ms {
-                                global_acc.min_duration_ms = chunk_acc.min_duration_ms;
-                            }
-                            if chunk_acc.max_duration_ms > global_acc.max_duration_ms {
-                                global_acc.max_duration_ms = chunk_acc.max_duration_ms;
-                            }
-                            global_acc.sketch.merge(&chunk_acc.sketch);
-                            for (st, cnt) in chunk_acc.status_counts {
-                                *global_acc.status_counts.entry(st).or_insert(0) += cnt;
-                            }
+            for (idx, chunk_acc) in res.slots {
+                match global_slots.get_mut(&idx) {
+                    Some(global_acc) => {
+                        global_acc.total_calls += chunk_acc.total_calls;
+                        global_acc.error_calls += chunk_acc.error_calls;
+                        global_acc.total_duration_ms += chunk_acc.total_duration_ms;
+                        if chunk_acc.min_duration_ms < global_acc.min_duration_ms {
+                            global_acc.min_duration_ms = chunk_acc.min_duration_ms;
                         }
-                        None => {
-                            global_slots[idx] = Some(chunk_acc);
+                        if chunk_acc.max_duration_ms > global_acc.max_duration_ms {
+                            global_acc.max_duration_ms = chunk_acc.max_duration_ms;
                         }
+                        global_acc.sketch.merge(&chunk_acc.sketch);
+                        for (st, cnt) in chunk_acc.status_counts {
+                            *global_acc.status_counts.entry(st).or_insert(0) += cnt;
+                        }
+                    }
+                    None => {
+                        global_slots.insert(idx, chunk_acc);
                     }
                 }
             }
         }
+
 
         // 5. Aggregate Cron Events
         let mut cron_map: HashMap<String, CronAcc> = HashMap::new();
@@ -373,38 +381,36 @@ impl Engine {
         let overall_p99 = overall_sketch.quantile(0.99);
 
         // 6. Build EndpointStats list
-        let mut endpoints: Vec<EndpointStats> = Vec::with_capacity(num_norm_paths);
-        for (idx, slot) in global_slots.into_iter().enumerate() {
-            if let Some(acc) = slot {
-                let norm_id = idx / 8;
-                let method_u8 = (idx % 8) as u8;
-                let method = Method::from_u8(method_u8).unwrap_or(Method::Get);
-                let path_bytes = &unique_norm_paths[norm_id];
-                let path_str = String::from_utf8_lossy(path_bytes).into_owned();
+        let mut endpoints: Vec<EndpointStats> = Vec::with_capacity(global_slots.len());
+        for (idx, acc) in global_slots {
+            let norm_id = (idx / 8) as usize;
+            let method_u8 = (idx % 8) as u8;
+            let method = Method::from_u8(method_u8).unwrap_or(Method::Get);
+            let path_bytes = &unique_norm_paths[norm_id];
+            let path_str = String::from_utf8_lossy(path_bytes).into_owned();
 
-                endpoints.push(EndpointStats {
-                    path: path_str,
-                    method,
-                    total_calls: acc.total_calls,
-                    error_calls: acc.error_calls,
-                    total_duration_ms: acc.total_duration_ms,
-                    min_duration_ms: if acc.min_duration_ms == f32::MAX {
-                        0.0
-                    } else {
-                        acc.min_duration_ms
-                    },
-                    max_duration_ms: if acc.max_duration_ms == f32::MIN {
-                        0.0
-                    } else {
-                        acc.max_duration_ms
-                    },
-                    p50_ms: acc.sketch.quantile(0.50),
-                    p90_ms: acc.sketch.quantile(0.90),
-                    p95_ms: acc.sketch.quantile(0.95),
-                    p99_ms: acc.sketch.quantile(0.99),
-                    status_counts: acc.status_counts.into_iter().collect(),
-                });
-            }
+            endpoints.push(EndpointStats {
+                path: path_str,
+                method,
+                total_calls: acc.total_calls,
+                error_calls: acc.error_calls,
+                total_duration_ms: acc.total_duration_ms,
+                min_duration_ms: if acc.min_duration_ms == f32::MAX {
+                    0.0
+                } else {
+                    acc.min_duration_ms
+                },
+                max_duration_ms: if acc.max_duration_ms == f32::MIN {
+                    0.0
+                } else {
+                    acc.max_duration_ms
+                },
+                p50_ms: acc.sketch.quantile(0.50),
+                p90_ms: acc.sketch.quantile(0.90),
+                p95_ms: acc.sketch.quantile(0.95),
+                p99_ms: acc.sketch.quantile(0.99),
+                status_counts: acc.status_counts.into_iter().collect(),
+            });
         }
 
         let cron_jobs: Vec<CronStats> = cron_map
@@ -583,11 +589,12 @@ fn strip_ansi_bytes(buf: &[u8]) -> Cow<'_, [u8]> {
 }
 
 struct ChunkResult {
-    slots: Vec<Option<Box<EndpointAcc>>>,
+    slots: FastHashMap<u32, EndpointAcc>,
     overall_sketch: RelHist,
     http_count: u64,
     error_count: u64,
 }
+
 
 struct EndpointAcc {
     total_calls: u64,

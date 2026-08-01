@@ -61,40 +61,25 @@ fn only_space_ansi_left(buf: &[u8], i: usize, end: usize) -> bool {
     skip_space_ansi(buf, i, end) >= end
 }
 
+#[inline(always)]
 fn skip_timestamp(buf: &[u8], start: usize, end: usize) -> Option<usize> {
     if end - start < 20 {
         return None;
     }
     let a = start;
-    for k in 0..10 {
-        let c = buf[a + k];
-        if k == 4 || k == 7 {
-            if c != b'-' {
-                return None;
-            }
-        } else if !is_digit(c) {
-            return None;
-        }
+    if buf[a + 4] == b'-'
+        && buf[a + 7] == b'-'
+        && (buf[a + 10] == b'T' || buf[a + 10] == b' ')
+        && buf[a + 13] == b':'
+        && buf[a + 16] == b':'
+        && buf[a + 19] == b':'
+    {
+        Some(skip_space_ansi(buf, a + 20, end))
+    } else {
+        None
     }
-    let sep = buf[a + 10];
-    if sep != b'T' && sep != b' ' {
-        return None;
-    }
-    for k in 11..19 {
-        let c = buf[a + k];
-        if k == 13 || k == 16 {
-            if c != b':' {
-                return None;
-            }
-        } else if !is_digit(c) {
-            return None;
-        }
-    }
-    if buf[a + 19] != b':' {
-        return None;
-    }
-    Some(skip_space_ansi(buf, a + 20, end))
 }
+
 
 fn parse_method(buf: &[u8], mut i: usize, end: usize) -> Option<(Method, usize)> {
     i = skip_space_ansi(buf, i, end);
@@ -154,43 +139,54 @@ fn read_token(buf: &[u8], mut i: usize, end: usize) -> Option<(usize, usize, usi
     Some((start, i, i))
 }
 
+#[inline(always)]
 fn parse_float(buf: &[u8], mut i: usize, end: usize) -> Option<(f32, usize)> {
     i = skip_space_ansi(buf, i, end);
-    let start = i;
-    while i < end && is_digit(buf[i]) {
-        i += 1;
+    if i >= end {
+        return None;
+    }
+    let mut val: u32 = 0;
+    let mut digits = 0;
+    while i < end {
+        let c = buf[i];
+        if c >= b'0' && c <= b'9' {
+            val = val * 10 + (c - b'0') as u32;
+            digits += 1;
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if digits == 0 {
+        return None;
     }
     if i < end && buf[i] == b'.' {
         i += 1;
-        while i < end && is_digit(buf[i]) {
-            i += 1;
+        let mut frac: u32 = 0;
+        let mut frac_digits = 0;
+        while i < end {
+            let c = buf[i];
+            if c >= b'0' && c <= b'9' {
+                frac = frac * 10 + (c - b'0') as u32;
+                frac_digits += 1;
+                i += 1;
+            } else {
+                break;
+            }
         }
-    }
-    if i == start {
-        return None;
-    }
-    let mut value: f32 = 0.0;
-    let mut frac: f32 = 0.0;
-    let mut frac_div: f32 = 1.0;
-    let mut seen_dot = false;
-    for &c in &buf[start..i] {
-        if c == b'.' {
-            seen_dot = true;
-            continue;
-        }
-        let d = (c - b'0') as f32;
-        if !seen_dot {
-            value = value * 10.0 + d;
+        static DIVS: [f32; 6] = [1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0];
+        let divisor = if (frac_digits as usize) < DIVS.len() {
+            DIVS[frac_digits as usize]
         } else {
-            frac = frac * 10.0 + d;
-            frac_div *= 10.0;
-        }
+            10.0f32.powi(frac_digits as i32)
+        };
+        let res = (val as f32) + (frac as f32) / divisor;
+        Some((res, i))
+    } else {
+        Some((val as f32, i))
     }
-    if seen_dot {
-        value += frac / frac_div;
-    }
-    Some((value, i))
 }
+
 
 fn has_non_space(buf: &[u8], start: usize, end: usize) -> bool {
     let mut i = start;
@@ -378,22 +374,35 @@ pub fn parse_line_bytes<'a>(buf: &'a [u8], start: usize, mut end: usize) -> Line
     if end > start && buf[end - 1] == b'\r' {
         end -= 1;
     }
+    if end <= start {
+        return LineKind::Empty;
+    }
+
+    // Fast Path 1: Try HTTP Format A first (matches >95% of requests instantly)
+    if let Some(k) = try_http_a(buf, start, end) {
+        return k;
+    }
+
+    // Fast Path 2: Try HTTP Format B
+    if let Some(k) = try_http_b(buf, start, end) {
+        return k;
+    }
+
+    // Fallback: Check if empty or whitespace only
     if !has_non_space(buf, start, end) {
         return LineKind::Empty;
     }
+
+    // Fallback: Check for Cron events
     if find_cron_mark(buf, start, end).is_some() {
         if let Some(k) = try_cron(buf, start, end) {
             return k;
         }
     }
-    if let Some(k) = try_http_a(buf, start, end) {
-        return k;
-    }
-    if let Some(k) = try_http_b(buf, start, end) {
-        return k;
-    }
+
     LineKind::Unmatched(&buf[start..end])
 }
+
 
 #[cfg(test)]
 mod tests {
