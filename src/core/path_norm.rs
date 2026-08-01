@@ -112,13 +112,11 @@ fn is_uuid(seg: &[u8]) -> bool {
     if seg.len() != 36 {
         return false;
     }
-    let positions = [8usize, 13, 18, 23];
+    if seg[8] != b'-' || seg[13] != b'-' || seg[18] != b'-' || seg[23] != b'-' {
+        return false;
+    }
     for (i, &c) in seg.iter().enumerate() {
-        if positions.contains(&i) {
-            if c != b'-' {
-                return false;
-            }
-        } else if !c.is_ascii_hexdigit() {
+        if i != 8 && i != 13 && i != 18 && i != 23 && !c.is_ascii_hexdigit() {
             return false;
         }
     }

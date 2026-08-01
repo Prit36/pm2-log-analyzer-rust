@@ -503,6 +503,12 @@ pub fn parse_log_buffer(buffer: &[u8]) -> Engine {
 
 fn parse_chunk(chunk: &[u8]) -> Engine {
     let mut engine = Engine::new();
+    let est_lines = chunk.len() / 80;
+    engine.entries.reserve(est_lines);
+    engine.path_bytes.reserve(chunk.len() / 4);
+    engine.path_off.reserve(2048);
+    engine.path_len.reserve(2048);
+    engine.path_index.reserve(2048);
     let mut start = 0;
 
     while start < chunk.len() {
