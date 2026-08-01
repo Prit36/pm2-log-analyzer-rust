@@ -62,7 +62,7 @@ fn main() {
     let summary = engine.aggregate(file_size_bytes, parse_ms as u64, &default_filters);
 
     // Initial Endpoint Sort for Table Rendering
-    let sort_state = TableSortState {
+    let _sort_state = TableSortState {
         column: SortColumn::Calls,
         direction: SortDirection::Descending,
     };

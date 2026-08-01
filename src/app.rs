@@ -82,7 +82,7 @@ impl Pm2App {
         Self::default()
     }
 
-    pub fn load_file(&mut self, path: PathBuf) {
+    pub fn load_file(&mut self, path: PathBuf, ctx: egui::Context) {
         self.is_parsing = true;
         self.parse_progress = 0.1;
         self.status_msg = format!("Opening file {}...", path.display());
@@ -106,9 +106,11 @@ impl Pm2App {
                         file_size,
                         elapsed_ms,
                     });
+                    ctx.request_repaint();
                 }
                 Err(e) => {
                     let _ = tx.send(ParseMessage::Error(format!("Failed to open file: {}", e)));
+                    ctx.request_repaint();
                 }
             }
         });
@@ -177,14 +179,22 @@ impl Pm2App {
 }
 
 impl eframe::App for Pm2App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        std::process::exit(0);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.check_async_messages();
+
+        if self.is_parsing {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
 
         // Handle File Drag & Drop
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
                 if let Some(path) = i.raw.dropped_files[0].path.clone() {
-                    self.load_file(path);
+                    self.load_file(path, ctx.clone());
                 }
             }
         });
@@ -198,7 +208,7 @@ impl eframe::App for Pm2App {
 
                 if ui.button("📂 Open Log File").clicked() {
                     if let Some(path) = FileDialog::new().add_filter("Log files", &["log", "txt"]).pick_file() {
-                        self.load_file(path);
+                        self.load_file(path, ctx.clone());
                     }
                 }
 
@@ -261,7 +271,7 @@ impl eframe::App for Pm2App {
                     ui.add_space(20.0);
                     if ui.button("Select File from Disk").clicked() {
                         if let Some(path) = FileDialog::new().add_filter("Log files", &["log", "txt"]).pick_file() {
-                            self.load_file(path);
+                            self.load_file(path, ctx.clone());
                         }
                     }
                 });

@@ -1,12 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // Hide console window on Windows release builds
 
-mod app;
-mod core;
-mod ui;
-mod utils;
-
-use app::Pm2App;
 use eframe::NativeOptions;
+use pm2_log_analyzer::app::Pm2App;
 
 fn main() -> eframe::Result<()> {
     let native_options = NativeOptions {
@@ -15,6 +10,8 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([900.0, 600.0])
             .with_resizable(true),
+        multisampling: 0,
+        vsync: true,
         ..Default::default()
     };
 
@@ -24,3 +21,4 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| Ok(Box::new(Pm2App::new(cc)))),
     )
 }
+
