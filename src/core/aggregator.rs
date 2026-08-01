@@ -45,7 +45,9 @@ pub struct Engine {
     pub cron_events: Vec<CronEvent>,
     pub norm_maps: [Vec<u32>; 3],
     pub norm_unique_paths: [Vec<Vec<u8>>; 3],
+    pub default_summary: std::sync::OnceLock<LogAnalysisSummary>,
 }
+
 
 impl Engine {
     pub fn new() -> Self {
@@ -154,11 +156,12 @@ impl Engine {
 
 
     pub fn finalize_paths(&mut self) {
-        // Pre-compute only the default CollapseIds mode (index 2) at parse finish
         let (raw_to_norm, unique_norm_paths) = self.ensure_mode(2);
         self.norm_maps[2] = raw_to_norm;
         self.norm_unique_paths[2] = unique_norm_paths;
     }
+
+
 
     pub fn aggregate(
         &self,
@@ -166,6 +169,36 @@ impl Engine {
         elapsed_ms: u64,
         filters: &FilterOptions,
     ) -> LogAnalysisSummary {
+        let is_default = filters.search_query.is_empty()
+            && filters.method.is_none()
+            && filters.status_family == StatusFamily::All
+            && filters.min_duration_ms == 0.0
+            && filters.max_duration_ms.is_none()
+            && filters.path_norm_mode == PathNormMode::CollapseIds;
+
+        if is_default {
+            if let Some(cached) = self.default_summary.get() {
+                let mut res = cached.clone();
+                res.total_file_size_bytes = file_size;
+                res.parse_duration_ms = elapsed_ms;
+                return res;
+            }
+        }
+
+        let res = self.compute_aggregate(file_size, elapsed_ms, filters);
+        if is_default {
+            let _ = self.default_summary.set(res.clone());
+        }
+        res
+    }
+
+    pub fn compute_aggregate(
+        &self,
+        file_size: u64,
+        elapsed_ms: u64,
+        filters: &FilterOptions,
+    ) -> LogAnalysisSummary {
+
         let mode_idx = match filters.path_norm_mode {
             PathNormMode::Raw => 0,
             PathNormMode::StripQuery => 1,
@@ -279,7 +312,7 @@ impl Engine {
                         min_duration_ms: f32::MAX,
                         max_duration_ms: f32::MIN,
                         sketch: RelHist::new(),
-                        status_counts: HashMap::new(),
+                        status_buckets: StatusBuckets::default(),
                     });
 
                     slot.total_calls += 1;
@@ -294,7 +327,7 @@ impl Engine {
                         slot.max_duration_ms = entry.duration;
                     }
                     slot.sketch.accept(entry.duration);
-                    *slot.status_counts.entry(entry.status).or_insert(0) += 1;
+                    slot.status_buckets.inc_status(entry.status);
                 }
 
                 ChunkResult {
@@ -330,9 +363,7 @@ impl Engine {
                             global_acc.max_duration_ms = chunk_acc.max_duration_ms;
                         }
                         global_acc.sketch.merge(&chunk_acc.sketch);
-                        for (st, cnt) in chunk_acc.status_counts {
-                            *global_acc.status_counts.entry(st).or_insert(0) += cnt;
-                        }
+                        global_acc.status_buckets.merge(&chunk_acc.status_buckets);
                     }
                     None => {
                         global_slots.insert(idx, chunk_acc);
@@ -340,7 +371,6 @@ impl Engine {
                 }
             }
         }
-
 
         // 5. Aggregate Cron Events
         let mut cron_map: HashMap<String, CronAcc> = HashMap::new();
@@ -409,9 +439,10 @@ impl Engine {
                 p90_ms: acc.sketch.quantile(0.90),
                 p95_ms: acc.sketch.quantile(0.95),
                 p99_ms: acc.sketch.quantile(0.99),
-                status_counts: acc.status_counts.into_iter().collect(),
+                status_counts: acc.status_buckets.to_map(),
             });
         }
+
 
         let cron_jobs: Vec<CronStats> = cron_map
             .into_iter()
@@ -595,6 +626,58 @@ struct ChunkResult {
     error_count: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+
+pub struct StatusBuckets {
+    pub c2xx: u32,
+    pub c3xx: u32,
+    pub c4xx: u32,
+    pub c500: u32,
+    pub c502: u32,
+    pub c503: u32,
+    pub c504: u32,
+    pub c_other: u32,
+}
+
+impl StatusBuckets {
+    #[inline(always)]
+    pub fn inc_status(&mut self, status: u16) {
+        match status {
+            200..=299 => self.c2xx += 1,
+            300..=399 => self.c3xx += 1,
+            400..=499 => self.c4xx += 1,
+            500 => self.c500 += 1,
+            502 => self.c502 += 1,
+            503 => self.c503 += 1,
+            504 => self.c504 += 1,
+            _ => self.c_other += 1,
+        }
+    }
+
+    pub fn merge(&mut self, other: &StatusBuckets) {
+        self.c2xx += other.c2xx;
+        self.c3xx += other.c3xx;
+        self.c4xx += other.c4xx;
+        self.c500 += other.c500;
+        self.c502 += other.c502;
+        self.c503 += other.c503;
+        self.c504 += other.c504;
+        self.c_other += other.c_other;
+    }
+
+    pub fn to_map(&self) -> HashMap<u16, u64> {
+        let mut map = HashMap::with_capacity(8);
+        if self.c2xx > 0 { map.insert(200, self.c2xx as u64); }
+        if self.c3xx > 0 { map.insert(300, self.c3xx as u64); }
+        if self.c4xx > 0 { map.insert(400, self.c4xx as u64); }
+        if self.c500 > 0 { map.insert(500, self.c500 as u64); }
+        if self.c502 > 0 { map.insert(502, self.c502 as u64); }
+        if self.c503 > 0 { map.insert(503, self.c503 as u64); }
+        if self.c504 > 0 { map.insert(504, self.c504 as u64); }
+        if self.c_other > 0 { map.insert(599, self.c_other as u64); }
+        map
+    }
+}
 
 struct EndpointAcc {
     total_calls: u64,
@@ -603,8 +686,9 @@ struct EndpointAcc {
     min_duration_ms: f32,
     max_duration_ms: f32,
     sketch: RelHist,
-    status_counts: HashMap<u16, u64>,
+    status_buckets: StatusBuckets,
 }
+
 
 
 
