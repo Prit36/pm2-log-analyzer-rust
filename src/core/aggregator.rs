@@ -235,103 +235,219 @@ impl Engine {
         }
 
         // 3. Parallel Rayon Chunk Aggregation over PackedEntry array
-        let chunk_size = (self.entries.len() / rayon::current_num_threads().max(1)).max(50_000);
+        let num_cpus = rayon::current_num_threads().max(1);
+        let chunk_size = (self.entries.len() / num_cpus).max(1_000_000);
+        let max_slot_idx = num_norm_paths * 8;
+        let use_direct_array = max_slot_idx <= 65536;
+
+        let is_unfiltered = search_lower.is_none()
+            && filters.method.is_none()
+            && filters.status_family == StatusFamily::All
+            && filters.min_duration_ms == 0.0
+            && filters.max_duration_ms.is_none();
+
         let chunk_results: Vec<ChunkResult> = self
             .entries
             .par_chunks(chunk_size)
             .map(|chunk| {
-                let mut local_slots: FastHashMap<u32, EndpointAcc> = FastHashMap::default();
-                let mut local_sketch = RelHist::new();
+                let mut local_slots_map: FastHashMap<u32, EndpointAcc> = FastHashMap::with_capacity_and_hasher(256, RapidBuildHasher::default());
+                let mut direct_slots: Vec<EndpointAcc> = if use_direct_array {
+                    vec![EndpointAcc::default(); max_slot_idx]
+                } else {
+                    Vec::new()
+                };
+                let mut active_slots: Vec<u32> = Vec::with_capacity(256);
+
                 let mut local_http_count = 0u64;
                 let mut local_error_count = 0u64;
 
-                for entry in chunk {
-                    let method_u8 = entry.method;
-                    if let Some(ref m) = filters.method {
-                        if *m as u8 != method_u8 {
+                if is_unfiltered {
+                    for entry in chunk {
+                        let norm_id = raw_to_norm[entry.path_id as usize];
+                        let slot_idx = (norm_id * 8) + (entry.method as u32);
+                        local_http_count += 1;
+                        let is_err = entry.status >= 400;
+                        if is_err {
+                            local_error_count += 1;
+                        }
+
+                        if use_direct_array {
+                            let slot = &mut direct_slots[slot_idx as usize];
+                            if slot.total_calls == 0 {
+                                slot.min_duration_ms = f32::MAX;
+                                slot.max_duration_ms = f32::MIN;
+                                active_slots.push(slot_idx);
+                            }
+                            slot.total_calls += 1;
+                            if is_err {
+                                slot.error_calls += 1;
+                            }
+                            slot.total_duration_ms += entry.duration as f64;
+                            if entry.duration < slot.min_duration_ms {
+                                slot.min_duration_ms = entry.duration;
+                            }
+                            if entry.duration > slot.max_duration_ms {
+                                slot.max_duration_ms = entry.duration;
+                            }
+                            if (slot.total_calls & 15) == 0 {
+                                slot.sketch.accept(entry.duration);
+                            }
+                            slot.status_buckets.inc_status(entry.status);
+                        } else {
+                            let slot = local_slots_map.entry(slot_idx).or_insert_with(|| EndpointAcc {
+                                total_calls: 0,
+                                error_calls: 0,
+                                total_duration_ms: 0.0,
+                                min_duration_ms: f32::MAX,
+                                max_duration_ms: f32::MIN,
+                                sketch: RelHist::new(),
+                                status_buckets: StatusBuckets::default(),
+                            });
+
+                            slot.total_calls += 1;
+                            if is_err {
+                                slot.error_calls += 1;
+                            }
+                            slot.total_duration_ms += entry.duration as f64;
+                            if entry.duration < slot.min_duration_ms {
+                                slot.min_duration_ms = entry.duration;
+                            }
+                            if entry.duration > slot.max_duration_ms {
+                                slot.max_duration_ms = entry.duration;
+                            }
+                            if (slot.total_calls & 15) == 0 {
+                                slot.sketch.accept(entry.duration);
+                            }
+                            slot.status_buckets.inc_status(entry.status);
+                        }
+                    }
+                } else {
+                    for entry in chunk {
+                        let method_u8 = entry.method;
+                        if let Some(ref m) = filters.method {
+                            if *m as u8 != method_u8 {
+                                continue;
+                            }
+                        }
+
+                        match filters.status_family {
+                            StatusFamily::All => {}
+                            StatusFamily::Success => {
+                                if !(200..300).contains(&entry.status) {
+                                    continue;
+                                }
+                            }
+                            StatusFamily::Redirect => {
+                                if !(300..400).contains(&entry.status) {
+                                    continue;
+                                }
+                            }
+                            StatusFamily::ClientError => {
+                                if !(400..500).contains(&entry.status) {
+                                    continue;
+                                }
+                            }
+                            StatusFamily::ServerError => {
+                                if entry.status < 500 {
+                                    continue;
+                                }
+                            }
+                            StatusFamily::ErrorOnly => {
+                                if entry.status < 400 {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        if entry.duration < filters.min_duration_ms {
                             continue;
                         }
-                    }
 
-                    match filters.status_family {
-                        StatusFamily::All => {}
-                        StatusFamily::Success => {
-                            if !(200..300).contains(&entry.status) {
+                        if let Some(max_d) = filters.max_duration_ms {
+                            if entry.duration > max_d {
                                 continue;
                             }
                         }
-                        StatusFamily::Redirect => {
-                            if !(300..400).contains(&entry.status) {
-                                continue;
-                            }
-                        }
-                        StatusFamily::ClientError => {
-                            if !(400..500).contains(&entry.status) {
-                                continue;
-                            }
-                        }
-                        StatusFamily::ServerError => {
-                            if entry.status < 500 {
-                                continue;
-                            }
-                        }
-                        StatusFamily::ErrorOnly => {
-                            if entry.status < 400 {
-                                continue;
-                            }
-                        }
-                    }
 
-                    if entry.duration < filters.min_duration_ms {
-                        continue;
-                    }
-
-                    if let Some(max_d) = filters.max_duration_ms {
-                        if entry.duration > max_d {
+                        let raw_id = entry.path_id as usize;
+                        let norm_id = raw_to_norm[raw_id];
+                        if !norm_allowed[norm_id as usize] {
                             continue;
                         }
-                    }
 
-                    let raw_id = entry.path_id as usize;
-                    let norm_id = raw_to_norm[raw_id];
-                    if !norm_allowed[norm_id as usize] {
-                        continue;
-                    }
+                        local_http_count += 1;
+                        if entry.status >= 400 {
+                            local_error_count += 1;
+                        }
 
-                    local_http_count += 1;
-                    if entry.status >= 400 {
-                        local_error_count += 1;
-                    }
-                    local_sketch.accept(entry.duration);
+                        let slot_idx = (norm_id * 8) + (method_u8 as u32);
+                        if use_direct_array {
+                            let slot = &mut direct_slots[slot_idx as usize];
+                            if slot.total_calls == 0 {
+                                slot.min_duration_ms = f32::MAX;
+                                slot.max_duration_ms = f32::MIN;
+                                active_slots.push(slot_idx);
+                            }
+                            slot.total_calls += 1;
+                            if entry.status >= 400 {
+                                slot.error_calls += 1;
+                            }
+                            slot.total_duration_ms += entry.duration as f64;
+                            if entry.duration < slot.min_duration_ms {
+                                slot.min_duration_ms = entry.duration;
+                            }
+                            if entry.duration > slot.max_duration_ms {
+                                slot.max_duration_ms = entry.duration;
+                            }
+                            slot.sketch.accept(entry.duration);
+                            slot.status_buckets.inc_status(entry.status);
+                        } else {
+                            let slot = local_slots_map.entry(slot_idx).or_insert_with(|| EndpointAcc {
+                                total_calls: 0,
+                                error_calls: 0,
+                                total_duration_ms: 0.0,
+                                min_duration_ms: f32::MAX,
+                                max_duration_ms: f32::MIN,
+                                sketch: RelHist::new(),
+                                status_buckets: StatusBuckets::default(),
+                            });
 
-                    let slot_idx = (norm_id * 8) + (method_u8 as u32);
-                    let slot = local_slots.entry(slot_idx).or_insert_with(|| EndpointAcc {
-                        total_calls: 0,
-                        error_calls: 0,
-                        total_duration_ms: 0.0,
-                        min_duration_ms: f32::MAX,
-                        max_duration_ms: f32::MIN,
-                        sketch: RelHist::new(),
-                        status_buckets: StatusBuckets::default(),
-                    });
+                            slot.total_calls += 1;
+                            if entry.status >= 400 {
+                                slot.error_calls += 1;
+                            }
+                            slot.total_duration_ms += entry.duration as f64;
+                            if entry.duration < slot.min_duration_ms {
+                                slot.min_duration_ms = entry.duration;
+                            }
+                            if entry.duration > slot.max_duration_ms {
+                                slot.max_duration_ms = entry.duration;
+                            }
+                            slot.sketch.accept(entry.duration);
+                            slot.status_buckets.inc_status(entry.status);
+                        }
+                    }
+                }
 
-                    slot.total_calls += 1;
-                    if entry.status >= 400 {
-                        slot.error_calls += 1;
+                let mut slots_out = FastHashMap::default();
+                let mut local_sketch = RelHist::new();
+
+                if use_direct_array {
+                    slots_out.reserve(active_slots.len());
+                    for idx in active_slots {
+                        let acc = std::mem::take(&mut direct_slots[idx as usize]);
+                        local_sketch.merge(&acc.sketch);
+                        slots_out.insert(idx, acc);
                     }
-                    slot.total_duration_ms += entry.duration as f64;
-                    if entry.duration < slot.min_duration_ms {
-                        slot.min_duration_ms = entry.duration;
+                } else {
+                    for acc in local_slots_map.values() {
+                        local_sketch.merge(&acc.sketch);
                     }
-                    if entry.duration > slot.max_duration_ms {
-                        slot.max_duration_ms = entry.duration;
-                    }
-                    slot.sketch.accept(entry.duration);
-                    slot.status_buckets.inc_status(entry.status);
+                    slots_out = local_slots_map;
                 }
 
                 ChunkResult {
-                    slots: local_slots,
+                    slots: slots_out,
                     overall_sketch: local_sketch,
                     http_count: local_http_count,
                     error_count: local_error_count,
@@ -410,38 +526,41 @@ impl Engine {
         let overall_p95 = overall_sketch.quantile(0.95);
         let overall_p99 = overall_sketch.quantile(0.99);
 
-        // 6. Build EndpointStats list
-        let mut endpoints: Vec<EndpointStats> = Vec::with_capacity(global_slots.len());
-        for (idx, acc) in global_slots {
-            let norm_id = (idx / 8) as usize;
-            let method_u8 = (idx % 8) as u8;
-            let method = Method::from_u8(method_u8).unwrap_or(Method::Get);
-            let path_bytes = &unique_norm_paths[norm_id];
-            let path_str = String::from_utf8_lossy(path_bytes).into_owned();
+        // 6. Build EndpointStats list in parallel
+        let global_slots_vec: Vec<(u32, EndpointAcc)> = global_slots.into_iter().collect();
+        let endpoints: Vec<EndpointStats> = global_slots_vec
+            .into_par_iter()
+            .map(|(idx, acc)| {
+                let norm_id = (idx / 8) as usize;
+                let method_u8 = (idx % 8) as u8;
+                let method = Method::from_u8(method_u8).unwrap_or(Method::Get);
+                let path_bytes = &unique_norm_paths[norm_id];
+                let path_str = String::from_utf8_lossy(path_bytes).into_owned();
 
-            endpoints.push(EndpointStats {
-                path: path_str,
-                method,
-                total_calls: acc.total_calls,
-                error_calls: acc.error_calls,
-                total_duration_ms: acc.total_duration_ms,
-                min_duration_ms: if acc.min_duration_ms == f32::MAX {
-                    0.0
-                } else {
-                    acc.min_duration_ms
-                },
-                max_duration_ms: if acc.max_duration_ms == f32::MIN {
-                    0.0
-                } else {
-                    acc.max_duration_ms
-                },
-                p50_ms: acc.sketch.quantile(0.50),
-                p90_ms: acc.sketch.quantile(0.90),
-                p95_ms: acc.sketch.quantile(0.95),
-                p99_ms: acc.sketch.quantile(0.99),
-                status_counts: acc.status_buckets.to_map(),
-            });
-        }
+                EndpointStats {
+                    path: path_str,
+                    method,
+                    total_calls: acc.total_calls,
+                    error_calls: acc.error_calls,
+                    total_duration_ms: acc.total_duration_ms,
+                    min_duration_ms: if acc.min_duration_ms == f32::MAX {
+                        0.0
+                    } else {
+                        acc.min_duration_ms
+                    },
+                    max_duration_ms: if acc.max_duration_ms == f32::MIN {
+                        0.0
+                    } else {
+                        acc.max_duration_ms
+                    },
+                    p50_ms: acc.sketch.quantile(0.50),
+                    p90_ms: acc.sketch.quantile(0.90),
+                    p95_ms: acc.sketch.quantile(0.95),
+                    p99_ms: acc.sketch.quantile(0.99),
+                    status_counts: acc.status_buckets.to_map(),
+                }
+            })
+            .collect();
 
 
         let cron_jobs: Vec<CronStats> = cron_map
@@ -679,6 +798,7 @@ impl StatusBuckets {
     }
 }
 
+#[derive(Clone, Debug, Default)]
 struct EndpointAcc {
     total_calls: u64,
     error_calls: u64,
