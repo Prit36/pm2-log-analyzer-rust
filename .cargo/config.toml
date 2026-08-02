@@ -4,4 +4,9 @@ rustflags = [
     "-C", "link-arg=-lunwind"
 ]
 
+# Statically link the MSVC CRT so the release exe is a single standalone
+# binary that needs no VC++ redistributable or companion DLLs.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
 
