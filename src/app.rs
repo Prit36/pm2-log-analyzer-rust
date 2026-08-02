@@ -6,7 +6,7 @@ use crate::ui::cron_table::render_cron_table;
 use crate::ui::endpoint_table::{render_endpoint_table, SortColumn, SortDirection, TableSortState};
 use crate::ui::kpi_cards::render_kpi_dashboard;
 use crate::ui::raw_viewer::render_raw_viewer;
-use crate::utils::exporter::{export_to_csv, export_to_json};
+use crate::utils::exporter::{export_to_csv, export_to_excel, export_to_json};
 
 use egui::{Align, Color32, Layout, RichText};
 use rfd::FileDialog;
@@ -213,6 +213,16 @@ impl eframe::App for Pm2App {
                 }
 
                 if self.summary.matched_http_requests > 0 {
+                    if ui.button("💾 Export Excel").clicked() {
+                        if let Some(path) = FileDialog::new().set_file_name("pm2_analysis.xlsx").add_filter("Excel Workbook", &["xlsx"]).save_file() {
+                            if let Err(e) = export_to_excel(&self.summary, path.to_str().unwrap_or("")) {
+                                self.status_msg = format!("Export failed: {}", e);
+                            } else {
+                                self.status_msg = format!("Exported Excel to {}", path.display());
+                            }
+                        }
+                    }
+
                     if ui.button("💾 Export CSV").clicked() {
                         if let Some(path) = FileDialog::new().set_file_name("pm2_analysis.csv").save_file() {
                             if let Err(e) = export_to_csv(&self.summary, path.to_str().unwrap_or("")) {
