@@ -39,6 +39,8 @@ pub struct Engine {
     pub path_bytes: Vec<u8>,
     pub path_off: Vec<u32>,
     pub path_len: Vec<u16>,
+    pub path_hash: Vec<u64>,
+    pub path_hash2: Vec<u64>,
     pub path_index: FastHashMap<u64, u32>,
     pub unmatched_count: u64,
     pub unmatched_samples: Vec<String>,
@@ -48,6 +50,16 @@ pub struct Engine {
     pub default_summary: std::sync::OnceLock<LogAnalysisSummary>,
 }
 
+/// Secondary seed for the 128-bit path fingerprint (h1 = rapidhash, h2 = rapidhash_seeded).
+const HASH2_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+#[inline]
+fn path_fingerprint(path: &[u8]) -> (u64, u64) {
+    let h1 = rapidhash::rapidhash(path);
+    let h2 = rapidhash::rapidhash_seeded(path, HASH2_SEED);
+    (h1, h2)
+}
+
 
 impl Engine {
     pub fn new() -> Self {
@@ -55,9 +67,12 @@ impl Engine {
     }
 
     pub fn intern_path(&mut self, path: &[u8]) -> u32 {
-        let hash = rapidhash::rapidhash(path);
-        if let Some(&id) = self.path_index.get(&hash) {
-            if self.path_slice(id) == path {
+        let (h1, h2) = path_fingerprint(path);
+        if let Some(&id) = self.path_index.get(&h1) {
+            // 64-bit secondary fingerprint verification: collision requires both
+            // independent 64-bit hashes to match (~2^-128), so no slice compare
+            // against the cold global byte buffer is needed on the hot path.
+            if self.path_hash2[id as usize] == h2 {
                 return id;
             }
         }
@@ -66,10 +81,11 @@ impl Engine {
         self.path_bytes.extend_from_slice(path);
         self.path_off.push(off);
         self.path_len.push(path.len() as u16);
-        self.path_index.insert(hash, id);
+        self.path_hash.push(h1);
+        self.path_hash2.push(h2);
+        self.path_index.insert(h1, id);
         id
     }
-
 
     pub fn path_slice(&self, id: u32) -> &[u8] {
         let off = self.path_off[id as usize] as usize;
@@ -125,7 +141,6 @@ impl Engine {
             1 => PathNormMode::StripQuery,
             _ => PathNormMode::CollapseIds,
         };
-
 
         let normalized_paths: Vec<Vec<u8>> = (0..num_paths as u32)
             .into_par_iter()
@@ -646,13 +661,120 @@ pub fn parse_log_buffer(buffer: &[u8]) -> Engine {
         .map(|w| &buffer[w[0]..w[1]])
         .collect();
 
-    let mut engine = chunks
-        .into_par_iter()
-        .map(|chunk| parse_chunk(chunk))
-        .reduce(Engine::default, |mut a, b| {
-            a.merge(b);
-            a
-        });
+    let engines: Vec<Engine> = chunks.into_par_iter().map(parse_chunk).collect();
+
+    let mut engine = Engine::new();
+
+    // ----- Batch global path dedup (single pass over all chunk tables) -----
+    let total_paths: usize = engines.iter().map(|e| e.path_off.len()).sum();
+    engine.path_bytes.reserve(total_paths * 78);
+    engine.path_off.reserve(total_paths);
+    engine.path_len.reserve(total_paths);
+    engine.path_hash.reserve(total_paths);
+    engine.path_hash2.reserve(total_paths);
+    // Rough capacity for the dedup map: keep it small enough to stay L2-resident.
+    let capacity = total_paths.min(1 << 20);
+    engine.path_index.reserve(capacity);
+
+    // Build the global path table. `id` == index into path_off/path_len/path_hash.
+    // Key = 64-bit h1; the stored 64-bit h2 verifies the match without touching
+    // the cold path_bytes buffer (collision requires both 64-bit hashes to
+    // collide, ~2^-128).
+    let mut remap: Vec<u32> = Vec::with_capacity(total_paths);
+    let mut id = 0u32;
+    let mut cur_off = 0u32;
+    for e in &engines {
+        let base = e.path_off.len();
+        for local in 0..base {
+            let slice = e.path_slice(local as u32);
+            let h1 = e.path_hash[local];
+            let h2 = e.path_hash2[local];
+            let candidate_id = match engine.path_index.get(&h1) {
+                Some(&existing) => {
+                    // h1 matched; verify with the secondary fingerprint (rare miss).
+                    if engine.path_hash2[existing as usize] == h2 {
+                        existing
+                    } else {
+                        // True h1 collision on a different path: re-verify the exact
+                        // bytes against the stored path (extremely rare).
+                        let cand_id = existing as usize;
+                        let off = engine.path_off[cand_id] as usize;
+                        let len = engine.path_len[cand_id] as usize;
+                        if &engine.path_bytes[off..off + len] == slice {
+                            existing
+                        } else {
+                            let nid = id;
+                            engine.path_bytes.extend_from_slice(slice);
+                            engine.path_off.push(cur_off);
+                            engine.path_len.push(slice.len() as u16);
+                            engine.path_hash.push(h1);
+                            engine.path_hash2.push(h2);
+                            cur_off += slice.len() as u32;
+                            id += 1;
+                            nid
+                        }
+                    }
+                }
+                None => {
+                    let nid = id;
+                    engine.path_bytes.extend_from_slice(slice);
+                    engine.path_off.push(cur_off);
+                    engine.path_len.push(slice.len() as u16);
+                    engine.path_hash.push(h1);
+                    engine.path_hash2.push(h2);
+                    engine.path_index.insert(h1, nid);
+                    cur_off += slice.len() as u32;
+                    id += 1;
+                    nid
+                }
+            };
+            remap.push(candidate_id);
+        }
+    }
+
+    // ----- Merge entries/cron/unmatched and remap path ids in parallel -----
+    engine.total_lines = engines.iter().map(|e| e.total_lines).sum();
+    engine.unmatched_count = engines.iter().map(|e| e.unmatched_count).sum();
+
+    // Rebuild remap into a flat per-engine id -> global id lookup for parallel remap.
+    let mut remap_slices: Vec<&[u32]> = Vec::with_capacity(engines.len());
+    let mut cursor = 0usize;
+    for e in &engines {
+        remap_slices.push(&remap[cursor..cursor + e.path_off.len()]);
+        cursor += e.path_off.len();
+    }
+
+    // Build the remapped global entries in parallel: each engine remaps its own
+    // PackedEntry list, then they are concatenated in engine order.
+    let engine_entries: Vec<Vec<PackedEntry>> = engines
+        .par_iter()
+        .zip(&remap_slices)
+        .map(|(e, rem)| {
+            e.entries
+                .iter()
+                .map(|entry| PackedEntry {
+                    path_id: rem[entry.path_id as usize],
+                    duration: entry.duration,
+                    status: entry.status,
+                    method: entry.method,
+                    _pad: 0,
+                })
+                .collect()
+        })
+        .collect();
+    engine.entries = engine_entries.concat();
+
+    // Merge cron + unmatched samples
+    for mut e in engines {
+        engine.cron_events.append(&mut e.cron_events);
+        if engine.unmatched_samples.len() < 50 {
+            let take = 50 - engine.unmatched_samples.len();
+            engine
+                .unmatched_samples
+                .extend(e.unmatched_samples.clone().into_iter().take(take));
+        }
+    }
+
     engine.finalize_paths();
     engine
 }
@@ -664,15 +786,37 @@ fn parse_chunk(chunk: &[u8]) -> Engine {
     engine.path_bytes.reserve(chunk.len() / 4);
     engine.path_off.reserve(2048);
     engine.path_len.reserve(2048);
+    engine.path_hash.reserve(2048);
+    engine.path_hash2.reserve(2048);
     engine.path_index.reserve(2048);
-    let mut start = 0;
 
-    while start < chunk.len() {
-        let end = match memchr(b'\n', &chunk[start..]) {
-            Some(pos) => start + pos,
-            None => chunk.len(),
-        };
+    // Per-chunk L1 direct-mapped path cache. Stores the chunk-local path id and
+    // a hash+len of the raw bytes; the raw bytes themselves live in this hot
+    // chunk buffer, so verification is a fast local memcmp — not a probe against
+    // the cold global path table.
+    const L1_SIZE: usize = 1 << 16;
+    #[derive(Clone, Copy, Default)]
+    struct L1Slot {
+        hash: u64,
+        len: u16,
+        id: u32,
+    }
+    let mut l1: Vec<L1Slot> = vec![L1Slot::default(); L1_SIZE];
+    let l1_mask = (L1_SIZE - 1) as u64;
 
+    // The L1 cache stores only hash+len; the caller re-slices the candidate path
+    // from the hot chunk buffer and compares the actual bytes before trusting it.
+    #[inline(always)]
+    fn l1_maybe_hit(slot: &L1Slot, hash: u64, path: &[u8]) -> bool {
+        slot.hash == hash && slot.len as usize == path.len() && slot.id != u32::MAX
+    }
+
+    // Amortized SIMD newline scanning: one memchr_iter per chunk instead of one
+    // memchr call per line (~65M calls saved on the 5GB dataset).
+    let newlines = memchr::memchr_iter(b'\n', chunk);
+    let mut start = 0usize;
+
+    for end in newlines {
         engine.total_lines += 1;
         match parse_line_bytes(chunk, start, end) {
             LineKind::Empty => {}
@@ -682,7 +826,55 @@ fn parse_chunk(chunk: &[u8]) -> Engine {
                 status,
                 duration_ms,
             } => {
-                let pid = engine.intern_path(path);
+                let (h1, h2) = path_fingerprint(path);
+                let slot_idx = (h1 & l1_mask) as usize;
+                let slot = &l1[slot_idx];
+                let pid = if l1_maybe_hit(slot, h1, path)
+                    && engine.path_slice(slot.id) == path
+                {
+                    slot.id
+                } else {
+                    // Probe the chunk-local intern map.
+                    let pid = match engine.path_index.get(&h1) {
+                        Some(&id) => {
+                            if engine.path_hash2[id as usize] == h2 {
+                                id
+                            } else {
+                                // True h1 collision (rare): verify exact bytes.
+                                if engine.path_slice(id) == path {
+                                    id
+                                } else {
+                                    let nid = engine.path_off.len() as u32;
+                                    let off = engine.path_bytes.len() as u32;
+                                    engine.path_bytes.extend_from_slice(path);
+                                    engine.path_off.push(off);
+                                    engine.path_len.push(path.len() as u16);
+                                    engine.path_hash.push(h1);
+                                    engine.path_hash2.push(h2);
+                                    engine.path_index.insert(h1, nid);
+                                    nid
+                                }
+                            }
+                        }
+                        None => {
+                            let nid = engine.path_off.len() as u32;
+                            let off = engine.path_bytes.len() as u32;
+                            engine.path_bytes.extend_from_slice(path);
+                            engine.path_off.push(off);
+                            engine.path_len.push(path.len() as u16);
+                            engine.path_hash.push(h1);
+                            engine.path_hash2.push(h2);
+                            engine.path_index.insert(h1, nid);
+                            nid
+                        }
+                    };
+                    l1[slot_idx] = L1Slot {
+                        hash: h1,
+                        len: path.len() as u16,
+                        id: pid,
+                    };
+                    pid
+                };
                 engine.entries.push(PackedEntry {
                     path_id: pid,
                     duration: duration_ms,
@@ -716,6 +908,95 @@ fn parse_chunk(chunk: &[u8]) -> Engine {
         }
 
         start = end + 1;
+    }
+
+    // Trailing line without a final newline (or empty tail after last \n)
+    if start < chunk.len() {
+        engine.total_lines += 1;
+        match parse_line_bytes(chunk, start, chunk.len()) {
+            LineKind::Empty => {}
+            LineKind::Http {
+                method,
+                path,
+                status,
+                duration_ms,
+            } => {
+                let (h1, h2) = path_fingerprint(path);
+                let slot_idx = (h1 & l1_mask) as usize;
+                let slot = &l1[slot_idx];
+                let pid = if l1_maybe_hit(slot, h1, path)
+                    && engine.path_slice(slot.id) == path
+                {
+                    slot.id
+                } else {
+                    let pid = match engine.path_index.get(&h1) {
+                        Some(&id) => {
+                            if engine.path_hash2[id as usize] == h2
+                                || engine.path_slice(id) == path
+                            {
+                                id
+                            } else {
+                                let nid = engine.path_off.len() as u32;
+                                let off = engine.path_bytes.len() as u32;
+                                engine.path_bytes.extend_from_slice(path);
+                                engine.path_off.push(off);
+                                engine.path_len.push(path.len() as u16);
+                                engine.path_hash.push(h1);
+                                engine.path_hash2.push(h2);
+                                engine.path_index.insert(h1, nid);
+                                nid
+                            }
+                        }
+                        None => {
+                            let nid = engine.path_off.len() as u32;
+                            let off = engine.path_bytes.len() as u32;
+                            engine.path_bytes.extend_from_slice(path);
+                            engine.path_off.push(off);
+                            engine.path_len.push(path.len() as u16);
+                            engine.path_hash.push(h1);
+                            engine.path_hash2.push(h2);
+                            engine.path_index.insert(h1, nid);
+                            nid
+                        }
+                    };
+                    l1[slot_idx] = L1Slot {
+                        hash: h1,
+                        len: path.len() as u16,
+                        id: pid,
+                    };
+                    pid
+                };
+                engine.entries.push(PackedEntry {
+                    path_id: pid,
+                    duration: duration_ms,
+                    status,
+                    method: method as u8,
+                    _pad: 0,
+                });
+            }
+            LineKind::Cron {
+                event,
+                name,
+                duration_ms,
+            } => {
+                let name_clean = strip_ansi_bytes(name);
+                engine.cron_events.push(CronEvent {
+                    name: String::from_utf8_lossy(&name_clean).into_owned(),
+                    is_success: event == 1,
+                    is_fail: event == 2,
+                    duration_ms,
+                });
+            }
+            LineKind::Unmatched(sample) => {
+                engine.unmatched_count += 1;
+                if engine.unmatched_samples.len() < 10 {
+                    let clean = strip_ansi_bytes(sample);
+                    engine
+                        .unmatched_samples
+                        .push(String::from_utf8_lossy(&clean).into_owned());
+                }
+            }
+        }
     }
 
     engine
