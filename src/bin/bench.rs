@@ -1,9 +1,8 @@
 use pm2_log_analyzer::core::aggregator::parse_log_buffer;
 use pm2_log_analyzer::core::mmap::MmapReader;
 use pm2_log_analyzer::core::models::{
-    FilterOptions, Method, PathNormMode, StatusFamily,
+    FilterOptions, Method, PathNormMode, SortColumn, SortDirection, StatusFamily, TableSortState,
 };
-use pm2_log_analyzer::ui::endpoint_table::{SortColumn, SortDirection, TableSortState};
 use std::env;
 use std::path::PathBuf;
 use std::time::Instant;

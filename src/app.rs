@@ -1,390 +1,272 @@
+use dioxus::prelude::*;
 use crate::core::aggregator::{parse_log_buffer, Engine};
 use crate::core::mmap::MmapReader;
-use crate::core::models::{EndpointStats, FilterOptions, LogAnalysisSummary, Method, PathNormMode, StatusFamily};
-use crate::ui::charts::render_charts;
-use crate::ui::cron_table::render_cron_table;
-use crate::ui::endpoint_table::{render_endpoint_table, SortColumn, SortDirection, TableSortState};
-use crate::ui::kpi_cards::render_kpi_dashboard;
-use crate::ui::raw_viewer::render_raw_viewer;
-use crate::utils::exporter::{export_to_csv, export_to_excel, export_to_json};
-
-use egui::{Align, Color32, Layout, RichText};
-use rfd::FileDialog;
+use crate::core::models::{EndpointStats, FilterOptions, LogAnalysisSummary};
+use crate::ui::*;
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::thread;
-use std::time::Instant;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActiveTab {
-    Endpoints,
-    CronJobs,
-    Charts,
-    RawLogs,
-}
+const STYLE_CSS: &str = include_str!("../assets/style.css");
 
-enum ParseMessage {
-    Complete {
-        engine: Arc<Engine>,
-        summary: LogAnalysisSummary,
-        file_size: u64,
-        elapsed_ms: u64,
-    },
-    Error(String),
-}
+#[component]
+pub fn App() -> Element {
+    let theme = use_signal(|| "light".to_string());
+    let mut source_kind = use_signal(|| "none".to_string());
+    let mut file_name = use_signal(|| None::<String>);
+    let mut file_size = use_signal(|| 0u64);
+    let mut has_data = use_signal(|| false);
+    let mut is_parsing = use_signal(|| false);
+    let mut progress_percent = use_signal(|| 0u32);
+    let mut status_msg = use_signal(|| "Ready".to_string());
 
-pub struct Pm2App {
-    pub current_file: Option<PathBuf>,
-    pub is_parsing: bool,
-    pub parse_progress: f32,
-    pub status_msg: String,
+    let mut engine = use_signal(|| None::<Arc<Engine>>);
+    let mut summary = use_signal(|| LogAnalysisSummary::default());
+    let mut sorted_endpoints = use_signal(|| Vec::<EndpointStats>::new());
 
-    pub engine: Option<Arc<Engine>>,
-    pub file_size: u64,
-    pub parse_duration_ms: u64,
-    pub summary: LogAnalysisSummary,
-    pub sorted_endpoints: Vec<EndpointStats>,
+    let filters = use_signal(|| FilterOptions::default());
+    let sort_key = use_signal(|| "p95Ms".to_string());
+    let top_n = use_signal(|| 50usize);
+    let selected_methods = use_signal(|| Vec::<String>::new());
 
-    pub filters: FilterOptions,
-    pub sort_state: TableSortState,
-    pub active_tab: ActiveTab,
+    let mut cron_jobs = use_signal(|| Vec::<crate::core::models::CronJobStats>::new());
+    let mut unmatched_count = use_signal(|| 0u64);
+    let mut unmatched_samples = use_signal(|| Vec::<String>::new());
 
-    tx: Sender<ParseMessage>,
-    rx: Receiver<ParseMessage>,
-}
+    let mut toast_msg = use_signal(|| None::<String>);
 
-impl Default for Pm2App {
-    fn default() -> Self {
-        let (tx, rx) = channel();
-        Self {
-            current_file: None,
-            is_parsing: false,
-            parse_progress: 0.0,
-            status_msg: "Ready. Drop a PM2 log file or click Open File.".to_string(),
-            engine: None,
-            file_size: 0,
-            parse_duration_ms: 0,
-            summary: LogAnalysisSummary::default(),
-            sorted_endpoints: Vec::new(),
-            filters: FilterOptions::default(),
-            sort_state: TableSortState::default(),
-            active_tab: ActiveTab::Endpoints,
-            tx,
-            rx,
+    let mut show_toast = move |msg: String| {
+        toast_msg.set(Some(msg));
+        spawn(async move {
+            tokio_time_sleep().await;
+            toast_msg.set(None);
+        });
+    };
+
+    let mut recompute = move || {
+        if let Some(ref eng) = *engine.read() {
+            let f = filters();
+            let sum = eng.aggregate(file_size(), 0, &f);
+            let mut sorted = sum.endpoints.clone();
+            
+            let sel_m = selected_methods();
+            if !sel_m.is_empty() {
+                sorted.retain(|e| sel_m.contains(&e.method.as_str().to_string()));
+            }
+
+            let sk = sort_key();
+            sorted.sort_by(|a, b| {
+                let cmp = match sk.as_str() {
+                    "count" => b.total_calls.cmp(&a.total_calls),
+                    "avgMs" => b.avg_duration_ms().partial_cmp(&a.avg_duration_ms()).unwrap_or(std::cmp::Ordering::Equal),
+                    "maxMs" => b.max_duration_ms.partial_cmp(&a.max_duration_ms).unwrap_or(std::cmp::Ordering::Equal),
+                    "p99Ms" => b.p99_ms.partial_cmp(&a.p99_ms).unwrap_or(std::cmp::Ordering::Equal),
+                    "errorCount" => b.failed_calls.cmp(&a.failed_calls),
+                    _ => b.p95_ms.partial_cmp(&a.p95_ms).unwrap_or(std::cmp::Ordering::Equal),
+                };
+                cmp
+            });
+
+            sorted.truncate(top_n());
+            cron_jobs.set(sum.cron_jobs.clone());
+            unmatched_count.set(sum.unmatched_lines as u64);
+            unmatched_samples.set(sum.unmatched_samples.clone());
+            sorted_endpoints.set(sorted);
+            summary.set(sum);
         }
-    }
-}
+    };
 
-impl Pm2App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        crate::ui::theme::apply_ops_theme(&cc.egui_ctx);
-        Self::default()
-    }
+    let mut load_file = move |path: PathBuf| {
+        is_parsing.set(true);
+        progress_percent.set(20);
+        status_msg.set(format!("Opening {}", path.display()));
+        source_kind.set("file".to_string());
+        file_name.set(Some(path.file_name().unwrap_or_default().to_string_lossy().to_string()));
 
-    pub fn load_file(&mut self, path: PathBuf, ctx: egui::Context) {
-        self.is_parsing = true;
-        self.parse_progress = 0.1;
-        self.status_msg = format!("Opening file {}...", path.display());
-        self.current_file = Some(path.clone());
+        let f_opts = filters();
 
-        let tx = self.tx.clone();
-        let filters = self.filters.clone();
-        thread::spawn(move || {
-            let start = Instant::now();
-            match MmapReader::open(&path) {
-                Ok(reader) => {
-                    let file_size = reader.len() as u64;
-                    let engine = parse_log_buffer(reader.as_slice());
+        spawn(async move {
+            let res = tokio::task::spawn_blocking(move || {
+                let start = std::time::Instant::now();
+                if let Ok(reader) = MmapReader::open(&path) {
+                    let f_size = reader.len() as u64;
+                    let eng = parse_log_buffer(reader.as_slice());
                     let elapsed_ms = start.elapsed().as_millis() as u64;
-                    let summary = engine.aggregate(file_size, elapsed_ms, &filters);
-                    let engine = Arc::new(engine);
+                    let sum = eng.aggregate(f_size, elapsed_ms, &f_opts);
 
-                    let _ = tx.send(ParseMessage::Complete {
-                        engine,
-                        summary,
-                        file_size,
-                        elapsed_ms,
-                    });
-                    ctx.request_repaint();
+                    let arc_eng = Arc::new(eng);
+                    let mut sorted = sum.endpoints.clone();
+                    sorted.sort_by(|a, b| b.p95_ms.partial_cmp(&a.p95_ms).unwrap_or(std::cmp::Ordering::Equal));
+                    sorted.truncate(50);
+
+                    Ok((f_size, arc_eng, sum, sorted, elapsed_ms))
+                } else {
+                    Err("Failed to open file".to_string())
                 }
-                Err(e) => {
-                    let _ = tx.send(ParseMessage::Error(format!("Failed to open file: {}", e)));
-                    ctx.request_repaint();
+            }).await;
+
+            match res {
+                Ok(Ok((f_size, arc_eng, sum, sorted, elapsed_ms))) => {
+                    file_size.set(f_size);
+                    engine.set(Some(arc_eng));
+                    cron_jobs.set(sum.cron_jobs.clone());
+                    unmatched_count.set(sum.unmatched_lines as u64);
+                    unmatched_samples.set(sum.unmatched_samples.clone());
+                    summary.set(sum);
+                    sorted_endpoints.set(sorted);
+                    has_data.set(true);
+                    is_parsing.set(false);
+                    progress_percent.set(100);
+                    status_msg.set(format!("Parsed in {} ms", elapsed_ms));
+                }
+                _ => {
+                    is_parsing.set(false);
+                    status_msg.set("Failed to open file".to_string());
                 }
             }
         });
-    }
+    };
 
-    pub fn update_sorted_endpoints(&mut self) {
-        let mut sorted = self.summary.endpoints.clone();
-        let col = self.sort_state.column;
-        let dir = self.sort_state.direction;
+    let mut analyze_paste = move |text: String| {
+        is_parsing.set(true);
+        progress_percent.set(30);
+        status_msg.set("Analyzing pasted text...".to_string());
+        source_kind.set("paste".to_string());
+        file_name.set(None);
+        let f_size_val = text.len() as u64;
+        file_size.set(f_size_val);
 
-        sorted.sort_by(|a, b| {
-            let cmp = match col {
-                SortColumn::Path => a.path.cmp(&b.path),
-                SortColumn::Method => a.method.as_str().cmp(b.method.as_str()),
-                SortColumn::Calls => a.total_calls.cmp(&b.total_calls),
-                SortColumn::ErrorRate => a.error_rate().total_cmp(&b.error_rate()),
-                SortColumn::AvgDuration => a.avg_duration_ms().total_cmp(&b.avg_duration_ms()),
-                SortColumn::P50 => a.p50_ms.total_cmp(&b.p50_ms),
-                SortColumn::P95 => a.p95_ms.total_cmp(&b.p95_ms),
-                SortColumn::P99 => a.p99_ms.total_cmp(&b.p99_ms),
-            };
-            match dir {
-                SortDirection::Ascending => cmp,
-                SortDirection::Descending => cmp.reverse(),
+        let f_opts = filters();
+
+        spawn(async move {
+            let res = tokio::task::spawn_blocking(move || {
+                let start = std::time::Instant::now();
+                let eng = parse_log_buffer(text.as_bytes());
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                let sum = eng.aggregate(text.len() as u64, elapsed_ms, &f_opts);
+
+                let arc_eng = Arc::new(eng);
+                let mut sorted = sum.endpoints.clone();
+                sorted.sort_by(|a, b| b.p95_ms.partial_cmp(&a.p95_ms).unwrap_or(std::cmp::Ordering::Equal));
+                sorted.truncate(50);
+
+                (arc_eng, sum, sorted, elapsed_ms)
+            }).await;
+
+            if let Ok((arc_eng, sum, sorted, elapsed_ms)) = res {
+                engine.set(Some(arc_eng));
+                cron_jobs.set(sum.cron_jobs.clone());
+                unmatched_count.set(sum.unmatched_lines as u64);
+                unmatched_samples.set(sum.unmatched_samples.clone());
+                summary.set(sum);
+                sorted_endpoints.set(sorted);
+                has_data.set(true);
+                is_parsing.set(false);
+                progress_percent.set(100);
+                status_msg.set(format!("Parsed paste in {} ms", elapsed_ms));
+            } else {
+                is_parsing.set(false);
+                status_msg.set("Failed to analyze paste".to_string());
             }
         });
+    };
 
-        self.sorted_endpoints = sorted;
-    }
+    let clear_all = move |_| {
+        source_kind.set("none".to_string());
+        file_name.set(None);
+        file_size.set(0);
+        has_data.set(false);
+        engine.set(None);
+        summary.set(LogAnalysisSummary::default());
+        sorted_endpoints.set(Vec::new());
+        cron_jobs.set(Vec::new());
+        unmatched_count.set(0);
+        unmatched_samples.set(Vec::new());
+        is_parsing.set(false);
+        show_toast("Cleared loaded log data".to_string());
+    };
 
-    pub fn recompute_summary(&mut self) {
-        if let Some(ref engine) = self.engine {
-            self.summary = engine.aggregate(self.file_size, self.parse_duration_ms, &self.filters);
-            self.update_sorted_endpoints();
-        }
-    }
+    let is_dark = theme() == "dark";
 
-    fn check_async_messages(&mut self) {
-        while let Ok(msg) = self.rx.try_recv() {
-            match msg {
-                ParseMessage::Complete {
-                    engine,
-                    summary,
-                    file_size,
-                    elapsed_ms,
-                } => {
-                    self.is_parsing = false;
-                    self.file_size = file_size;
-                    self.parse_duration_ms = elapsed_ms;
-                    self.status_msg = format!(
-                        "Parsed {} lines in {} ms",
-                        engine.total_lines, elapsed_ms
-                    );
-                    self.engine = Some(engine);
-                    self.summary = summary;
-                    self.update_sorted_endpoints();
+    rsx! {
+        style { "{STYLE_CSS}" }
+        div { class: if is_dark { "dark min-h-full bg-[#0b0f19] text-slate-100 font-sans" } else { "min-h-full bg-[#f7f8fa] text-slate-900 font-sans" },
+            AppHeader {
+                theme: theme,
+                source_kind: source_kind,
+                file_name: file_name,
+                file_size: file_size,
+                has_data: has_data,
+                is_parsing: is_parsing,
+                summary: summary,
+                on_toast: move |msg| show_toast(msg),
+                on_clear: clear_all,
+            }
+            main { class: "mx-auto max-w-7xl space-y-4 px-4 py-4",
+                IngestPanel {
+                    has_data: has_data,
+                    is_parsing: is_parsing,
+                    progress_percent: progress_percent,
+                    on_file_select: move |path| load_file(path),
+                    on_paste_analyze: move |text| analyze_paste(text),
+                    on_toast: move |msg| show_toast(msg),
                 }
-                ParseMessage::Error(err) => {
-                    self.is_parsing = false;
-                    self.status_msg = err;
+
+                KpiRow {
+                    has_data: has_data,
+                    summary: summary,
                 }
+
+                FilterBar {
+                    has_data: has_data,
+                    filters: filters,
+                    sort_key: sort_key,
+                    top_n: top_n,
+                    selected_methods: selected_methods,
+                    on_filter_change: move |_| recompute(),
+                }
+
+                div { class: "grid gap-4 lg:grid-cols-5",
+                    div { class: "lg:col-span-3",
+                        ApiTable {
+                            endpoints: sorted_endpoints,
+                            on_toast: move |msg| show_toast(msg),
+                        }
+                    }
+                    div { class: "lg:col-span-2",
+                        LatencyChart {
+                            has_data: has_data,
+                            summary: summary,
+                            endpoints: sorted_endpoints,
+                            theme: theme,
+                        }
+                    }
+                }
+
+                CronTable {
+                    jobs: cron_jobs,
+                    on_toast: move |msg| show_toast(msg),
+                }
+
+                SkippedDisclosure {
+                    unmatched_count: unmatched_count,
+                    samples: unmatched_samples,
+                    has_data: has_data,
+                }
+
+                footer { class: "pb-6 pt-2 text-center text-[11px] text-slate-400 dark:text-slate-500",
+                    "Parses in your native Windows engine - logs never leave this machine"
+                }
+            }
+            Toast {
+                toast_msg: toast_msg,
             }
         }
     }
-
 }
 
-impl eframe::App for Pm2App {
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        std::process::exit(0);
-    }
-
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.check_async_messages();
-
-        if self.is_parsing {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
-        }
-
-        // Handle File Drag & Drop
-        ctx.input(|i| {
-            if !i.raw.dropped_files.is_empty() {
-                if let Some(path) = i.raw.dropped_files[0].path.clone() {
-                    self.load_file(path, ctx.clone());
-                }
-            }
-        });
-
-        // Top Control Bar
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("PM2 Log Analyzer Native").strong().size(18.0).color(Color32::WHITE));
-                ui.add_space(20.0);
-
-                if ui.button("📂 Open Log File").clicked() {
-                    if let Some(path) = FileDialog::new().add_filter("Log files", &["log", "txt"]).pick_file() {
-                        self.load_file(path, ctx.clone());
-                    }
-                }
-
-                if self.summary.matched_http_requests > 0 {
-                    if ui.button("💾 Export Excel").clicked() {
-                        if let Some(path) = FileDialog::new().set_file_name("pm2_analysis.xlsx").add_filter("Excel Workbook", &["xlsx"]).save_file() {
-                            if let Err(e) = export_to_excel(&self.summary, path.to_str().unwrap_or("")) {
-                                self.status_msg = format!("Export failed: {}", e);
-                            } else {
-                                self.status_msg = format!("Exported Excel to {}", path.display());
-                            }
-                        }
-                    }
-
-                    if ui.button("💾 Export CSV").clicked() {
-                        if let Some(path) = FileDialog::new().set_file_name("pm2_analysis.csv").save_file() {
-                            if let Err(e) = export_to_csv(&self.summary, path.to_str().unwrap_or("")) {
-                                self.status_msg = format!("Export failed: {}", e);
-                            } else {
-                                self.status_msg = format!("Exported CSV to {}", path.display());
-                            }
-                        }
-                    }
-
-                    if ui.button("💾 Export JSON").clicked() {
-                        if let Some(path) = FileDialog::new().set_file_name("pm2_analysis.json").save_file() {
-                            if let Err(e) = export_to_json(&self.summary, path.to_str().unwrap_or("")) {
-                                self.status_msg = format!("Export failed: {}", e);
-                            } else {
-                                self.status_msg = format!("Exported JSON to {}", path.display());
-                            }
-                        }
-                    }
-                }
-
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if self.is_parsing {
-                        ui.spinner();
-                        ui.label(RichText::new(&self.status_msg).color(Color32::from_rgb(245, 158, 11)));
-                    } else {
-                        ui.label(RichText::new(&self.status_msg).color(Color32::from_rgb(148, 163, 184)));
-                    }
-                });
-            });
-            ui.add_space(6.0);
-        });
-
-        // Bottom Status Bar
-        egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(ref path) = self.current_file {
-                    let display_str = format!("File: {}", path.display());
-                    let label = egui::Label::new(RichText::new(&display_str).size(11.0).color(Color32::from_rgb(148, 163, 184)))
-                        .truncate();
-                    ui.add(label).on_hover_text(path.to_string_lossy());
-                } else {
-                    ui.label(RichText::new("No file loaded").size(11.0).color(Color32::from_rgb(148, 163, 184)));
-                }
-            });
-        });
-
-        // Main Panel
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.summary.total_lines_parsed == 0 && !self.is_parsing {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
-                    ui.heading(RichText::new("Drop a PM2 log file here").size(24.0).color(Color32::WHITE));
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("Supports multi-gigabyte log files with instant memory-mapped multi-threaded parsing.").color(Color32::from_rgb(148, 163, 184)));
-                    ui.add_space(20.0);
-                    if ui.button("Select File from Disk").clicked() {
-                        if let Some(path) = FileDialog::new().add_filter("Log files", &["log", "txt"]).pick_file() {
-                            self.load_file(path, ctx.clone());
-                        }
-                    }
-                });
-                return;
-            }
-
-            // Render Top KPI Cards
-            render_kpi_dashboard(ui, &self.summary);
-            ui.add_space(16.0);
-
-            // Filter Bar
-            let mut filter_changed = false;
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Search:").strong().color(Color32::WHITE));
-                    if ui.add(egui::TextEdit::singleline(&mut self.filters.search_query).desired_width(220.0).hint_text("Filter path...")).changed() {
-                        filter_changed = true;
-                    }
-
-                    ui.separator();
-                    ui.label(RichText::new("Method:").strong().color(Color32::WHITE));
-                    let mut method_opt = self.filters.method.map(|m| m.as_str()).unwrap_or("ALL");
-                    egui::ComboBox::from_id_salt("method_combo")
-                        .selected_text(method_opt)
-                        .show_ui(ui, |ui| {
-                            if ui.selectable_value(&mut method_opt, "ALL", "ALL").clicked() {
-                                self.filters.method = None;
-                                filter_changed = true;
-                            }
-                            for m in &[Method::Get, Method::Post, Method::Put, Method::Patch, Method::Delete, Method::Options] {
-                                if ui.selectable_value(&mut method_opt, m.as_str(), m.as_str()).clicked() {
-                                    self.filters.method = Some(*m);
-                                    filter_changed = true;
-                                }
-                            }
-                        });
-
-                    ui.separator();
-                    ui.label(RichText::new("Status:").strong().color(Color32::WHITE));
-                    if ui.radio_value(&mut self.filters.status_family, StatusFamily::All, "All").changed()
-                        || ui.radio_value(&mut self.filters.status_family, StatusFamily::Success, "2xx").changed()
-                        || ui.radio_value(&mut self.filters.status_family, StatusFamily::ClientError, "4xx").changed()
-                        || ui.radio_value(&mut self.filters.status_family, StatusFamily::ServerError, "5xx").changed()
-                        || ui.radio_value(&mut self.filters.status_family, StatusFamily::ErrorOnly, "Errors Only").changed()
-                    {
-                        filter_changed = true;
-                    }
-
-                    ui.separator();
-                    ui.label(RichText::new("Path Norm:").strong().color(Color32::WHITE));
-                    let norm_text = match self.filters.path_norm_mode {
-                        PathNormMode::Raw => "Raw Path",
-                        PathNormMode::StripQuery => "Strip Query",
-                        PathNormMode::CollapseIds => "Collapse IDs (:id)",
-                    };
-                    egui::ComboBox::from_id_salt("norm_combo")
-                        .selected_text(norm_text)
-                        .show_ui(ui, |ui| {
-                            if ui.selectable_value(&mut self.filters.path_norm_mode, PathNormMode::CollapseIds, "Collapse IDs (:id)").clicked()
-                                || ui.selectable_value(&mut self.filters.path_norm_mode, PathNormMode::StripQuery, "Strip Query").clicked()
-                                || ui.selectable_value(&mut self.filters.path_norm_mode, PathNormMode::Raw, "Raw Path").clicked()
-                            {
-                                filter_changed = true;
-                            }
-                        });
-                });
-            });
-
-            if filter_changed {
-                self.recompute_summary();
-            }
-
-            ui.add_space(12.0);
-
-            // Tab navigation
-            ui.horizontal(|ui| {
-                if ui.selectable_label(self.active_tab == ActiveTab::Endpoints, "📊 API Endpoints").clicked() {
-                    self.active_tab = ActiveTab::Endpoints;
-                }
-                if ui.selectable_label(self.active_tab == ActiveTab::CronJobs, "⏱ Cron Jobs").clicked() {
-                    self.active_tab = ActiveTab::CronJobs;
-                }
-                if ui.selectable_label(self.active_tab == ActiveTab::Charts, "📈 Latency Charts").clicked() {
-                    self.active_tab = ActiveTab::Charts;
-                }
-                if ui.selectable_label(self.active_tab == ActiveTab::RawLogs, "🔍 Raw Log Samples").clicked() {
-                    self.active_tab = ActiveTab::RawLogs;
-                }
-            });
-
-            ui.separator();
-
-            // Render Active Tab content
-            match self.active_tab {
-                ActiveTab::Endpoints => {
-                    if render_endpoint_table(ui, &self.sorted_endpoints, &mut self.sort_state) {
-                        self.update_sorted_endpoints();
-                    }
-                }
-                ActiveTab::CronJobs => render_cron_table(ui, &self.summary.cron_jobs),
-                ActiveTab::Charts => render_charts(ui, &self.summary),
-                ActiveTab::RawLogs => render_raw_viewer(ui, &self.summary.unmatched_samples),
-            }
-        });
-    }
+async fn tokio_time_sleep() {
+    #[cfg(target_arch = "wasm32")]
+    gloo_timers::future::TimeoutFuture::new(3000).await;
+    #[cfg(not(target_arch = "wasm32"))]
+    tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
 }

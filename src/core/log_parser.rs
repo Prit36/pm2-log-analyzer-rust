@@ -1,5 +1,4 @@
 use super::models::Method;
-use memchr::memchr;
 use std::sync::LazyLock;
 
 static CRON_MARK: &[u8] = b"[cron]";
@@ -14,6 +13,7 @@ pub enum LineKind<'a> {
         path: &'a [u8],
         status: u16,
         duration_ms: f32,
+        hour: Option<u8>,
     },
     Cron {
         event: u8, // 0=start, 1=done, 2=fail
@@ -62,7 +62,7 @@ fn only_space_ansi_left(buf: &[u8], i: usize, end: usize) -> bool {
 }
 
 #[inline(always)]
-fn skip_timestamp(buf: &[u8], start: usize, end: usize) -> Option<usize> {
+fn skip_timestamp(buf: &[u8], start: usize, end: usize) -> Option<(usize, Option<u8>)> {
     if end - start < 20 {
         return None;
     }
@@ -74,12 +74,18 @@ fn skip_timestamp(buf: &[u8], start: usize, end: usize) -> Option<usize> {
         && buf[a + 16] == b':'
         && buf[a + 19] == b':'
     {
-        Some(skip_space_ansi(buf, a + 20, end))
+        let h1 = buf[a + 11];
+        let h2 = buf[a + 12];
+        let hour = if h1.is_ascii_digit() && h2.is_ascii_digit() {
+            Some((h1 - b'0') * 10 + (h2 - b'0'))
+        } else {
+            None
+        };
+        Some((skip_space_ansi(buf, a + 20, end), hour))
     } else {
         None
     }
 }
-
 
 fn parse_method(buf: &[u8], mut i: usize, end: usize) -> Option<(Method, usize)> {
     i = skip_space_ansi(buf, i, end);
@@ -99,368 +105,286 @@ fn parse_method(buf: &[u8], mut i: usize, end: usize) -> Option<(Method, usize)>
     }
     const OTHER_METHODS: &[(Method, &[u8])] = &[
         (Method::Put, b"PUT"),
-        (Method::Head, b"HEAD"),
         (Method::Patch, b"PATCH"),
         (Method::Delete, b"DELETE"),
         (Method::Options, b"OPTIONS"),
+        (Method::Head, b"HEAD"),
     ];
-    for &(method, bytes) in OTHER_METHODS {
-        if i + bytes.len() > end {
-            continue;
-        }
-        if &buf[i..i + bytes.len()] != bytes {
-            continue;
-        }
-        let after = i + bytes.len();
-        let next = if after < end { buf[after] } else { b' ' };
-        if next == b' ' || next == b'\t' || next == 0x1b || after >= end {
-            return Some((method, after));
+    for &(m, kw) in OTHER_METHODS {
+        let klen = kw.len();
+        if i + klen <= end && &buf[i..i + klen] == kw {
+            let after = i + klen;
+            let next = if after < end { buf[after] } else { b' ' };
+            if next == b' ' || next == b'\t' || next == 0x1b || after >= end {
+                return Some((m, after));
+            }
         }
     }
     None
 }
 
-fn read_token(buf: &[u8], mut i: usize, end: usize) -> Option<(usize, usize, usize)> {
+fn parse_u16_fast(buf: &[u8], mut i: usize, end: usize) -> Option<(u16, usize)> {
     i = skip_space_ansi(buf, i, end);
-    if i >= end {
-        return None;
-    }
-    let start = i;
+    let mut val: u16 = 0;
+    let mut count = 0;
     while i < end {
-        let c = buf[i];
-        if c == b' ' || c == b'\t' || c == 0x1b {
+        i = skip_ansi(buf, i, end);
+        if i >= end {
             break;
         }
-        i += 1;
-    }
-    if i == start {
-        return None;
-    }
-    Some((start, i, i))
-}
-
-#[inline(always)]
-fn parse_float(buf: &[u8], mut i: usize, end: usize) -> Option<(f32, usize)> {
-    i = skip_space_ansi(buf, i, end);
-    if i >= end {
-        return None;
-    }
-    let mut val: u32 = 0;
-    let mut digits = 0;
-    while i < end {
         let c = buf[i];
-        if c >= b'0' && c <= b'9' {
-            val = val * 10 + (c - b'0') as u32;
-            digits += 1;
+        if is_digit(c) {
+            val = val * 10 + (c - b'0') as u16;
+            count += 1;
             i += 1;
         } else {
             break;
         }
     }
-    if digits == 0 {
+    if count > 0 {
+        Some((val, i))
+    } else {
+        None
+    }
+}
+
+fn parse_f32_fast(buf: &[u8], mut i: usize, end: usize) -> Option<(f32, usize)> {
+    i = skip_space_ansi(buf, i, end);
+    let mut int_part: u32 = 0;
+    let mut count = 0;
+    while i < end {
+        i = skip_ansi(buf, i, end);
+        if i >= end {
+            break;
+        }
+        let c = buf[i];
+        if is_digit(c) {
+            int_part = int_part * 10 + (c - b'0') as u32;
+            count += 1;
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if count == 0 {
         return None;
     }
+
+    let mut frac_part: f32 = 0.0;
+    let mut divisor: f32 = 1.0;
     if i < end && buf[i] == b'.' {
         i += 1;
-        let mut frac: u32 = 0;
-        let mut frac_digits = 0;
         while i < end {
+            i = skip_ansi(buf, i, end);
+            if i >= end {
+                break;
+            }
             let c = buf[i];
-            if c >= b'0' && c <= b'9' {
-                frac = frac * 10 + (c - b'0') as u32;
-                frac_digits += 1;
+            if is_digit(c) {
+                divisor *= 10.0;
+                frac_part += (c - b'0') as f32 / divisor;
                 i += 1;
             } else {
                 break;
             }
         }
-        static DIVS: [f32; 6] = [1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0];
-        let divisor = if (frac_digits as usize) < DIVS.len() {
-            DIVS[frac_digits as usize]
-        } else {
-            10.0f32.powi(frac_digits as i32)
-        };
-        let res = (val as f32) + (frac as f32) / divisor;
-        Some((res, i))
-    } else {
-        Some((val as f32, i))
     }
+
+    Some((int_part as f32 + frac_part, i))
 }
 
+fn parse_cron_line<'a>(buf: &'a [u8], i: usize, _end: usize) -> Option<LineKind<'a>> {
+    let lower_buf: Vec<u8> = buf[i.._end].iter().map(|b| b.to_ascii_lowercase()).collect();
+    let lower_len = lower_buf.len();
 
-fn has_non_space(buf: &[u8], start: usize, end: usize) -> bool {
-    let mut i = start;
-    while i < end {
-        let c = buf[i];
-        if c > 32 && c != 0x1b {
-            return true;
-        }
-        if c == 0x1b {
-            i = skip_ansi(buf, i, end);
-            continue;
-        }
-        i += 1;
-    }
-    false
-}
+    let is_started = memchr::memmem::find(&lower_buf, b"started").is_some()
+        || memchr::memmem::find(&lower_buf, b"start").is_some();
+    let is_completed = memchr::memmem::find(&lower_buf, b"completed").is_some()
+        || memchr::memmem::find(&lower_buf, b"done").is_some()
+        || memchr::memmem::find(&lower_buf, b"success").is_some();
+    let is_failed = memchr::memmem::find(&lower_buf, b"failed").is_some()
+        || memchr::memmem::find(&lower_buf, b"fail").is_some()
+        || memchr::memmem::find(&lower_buf, b"error").is_some();
 
-fn try_http_a<'a>(buf: &'a [u8], start: usize, end: usize) -> Option<LineKind<'a>> {
-    let mut i = skip_space_ansi(buf, start, end);
-    if let Some(ni) = skip_timestamp(buf, i, end) {
-        i = ni;
-    }
-    let (method, ni) = parse_method(buf, i, end)?;
-    i = ni;
-    let (ps, pe, ni) = read_token(buf, i, end)?;
-    i = ni;
-    let (ss, se, ni) = read_token(buf, i, end)?;
-    if se - ss != 3 {
+    if !is_started && !is_completed && !is_failed {
         return None;
     }
-    let s0 = buf[ss];
-    let s1 = buf[ss + 1];
-    let s2 = buf[ss + 2];
-    if !is_digit(s0) || !is_digit(s1) || !is_digit(s2) {
-        return None;
-    }
-    let status = ((s0 - b'0') as u16) * 100 + ((s1 - b'0') as u16) * 10 + ((s2 - b'0') as u16);
-    i = ni;
-    let (dur, ni) = parse_float(buf, i, end)?;
-    i = skip_space_ansi(buf, ni, end);
-    if i + 1 >= end || buf[i] != b'm' || buf[i + 1] != b's' {
-        return None;
-    }
-    i = skip_space_ansi(buf, i + 2, end);
-    if i >= end || buf[i] != b'-' {
-        return None;
-    }
-    i = skip_space_ansi(buf, i + 1, end);
-    if i >= end {
-        return None;
-    }
-    if buf[i] == b'-' {
-        i += 1;
-    } else {
-        let b0 = i;
-        while i < end && is_digit(buf[i]) {
-            i += 1;
-        }
-        if i == b0 {
-            return None;
-        }
-    }
-    if !only_space_ansi_left(buf, i, end) {
-        return None;
-    }
-    Some(LineKind::Http {
-        method,
-        path: &buf[ps..pe],
-        status,
-        duration_ms: dur,
-    })
-}
 
-fn try_http_b<'a>(buf: &'a [u8], start: usize, end: usize) -> Option<LineKind<'a>> {
-    let mut i = skip_space_ansi(buf, start, end);
-    let (dur, ni) = parse_float(buf, i, end)?;
-    i = skip_space_ansi(buf, ni, end);
-    if i + 1 >= end || buf[i] != b'm' || buf[i + 1] != b's' {
-        return None;
-    }
-    i = skip_space_ansi(buf, i + 2, end);
-    let (method, ni) = parse_method(buf, i, end)?;
-    i = ni;
-    let (ps, pe, ni) = read_token(buf, i, end)?;
-    if !only_space_ansi_left(buf, ni, end) {
-        return None;
-    }
-    Some(LineKind::Http {
-        method,
-        path: &buf[ps..pe],
-        status: 200,
-        duration_ms: dur,
-    })
-}
+    let cron_idx = CRON_FINDER.find(&lower_buf)?;
+    let after_cron = cron_idx + 6;
 
-fn find_cron_mark(buf: &[u8], from: usize, end: usize) -> Option<usize> {
-    if from >= end {
-        return None;
+    let mut name_start = after_cron;
+    while name_start < lower_len && (lower_buf[name_start] == b' ' || lower_buf[name_start] == b'\t') {
+        name_start += 1;
     }
-    if memchr(b'[', &buf[from..end]).is_none() {
-        return None;
-    }
-    CRON_FINDER.find(&buf[from..end]).map(|rel| from + rel)
-}
 
-fn try_cron<'a>(buf: &'a [u8], start: usize, end: usize) -> Option<LineKind<'a>> {
-    let mut i = skip_space_ansi(buf, start, end);
-    if let Some(ni) = skip_timestamp(buf, i, end) {
-        i = ni;
-    }
-    let cron_idx = find_cron_mark(buf, i, end)?;
-    let mut k = i;
-    while k < cron_idx {
-        k = skip_ansi(buf, k, end);
-        if k >= cron_idx {
-            break;
+    let first_word_end = {
+        let mut e = name_start;
+        while e < lower_len && lower_buf[e] != b' ' && lower_buf[e] != b'\t' && lower_buf[e] != b'\r' && lower_buf[e] != b'\n' {
+            e += 1;
         }
-        let c = buf[k];
-        if c == b' ' || c == b'\t' {
-            k += 1;
-            continue;
-        }
-        return None;
-    }
-    i = skip_space_ansi(buf, cron_idx + 6, end);
-    let event = if i + 5 <= end && &buf[i..i + 5] == b"start" && (i + 5 >= end || buf[i + 5] == b' ')
-    {
-        i += 5;
-        0u8
-    } else if i + 4 <= end && &buf[i..i + 4] == b"done" && (i + 4 >= end || buf[i + 4] == b' ') {
-        i += 4;
-        1
-    } else if i + 4 <= end && &buf[i..i + 4] == b"fail" && (i + 4 >= end || buf[i + 4] == b' ') {
-        i += 4;
-        2
-    } else {
-        return None;
+        e
     };
-    i = skip_space_ansi(buf, i, end);
-    let name_slice = &buf[i..end];
-    let mut lo = 0usize;
-    let mut hi = name_slice.len();
-    while lo < hi && (name_slice[lo] == b' ' || name_slice[lo] == b'\t') {
-        lo += 1;
+    let first_word = &lower_buf[name_start..first_word_end];
+    if first_word == b"done"
+        || first_word == b"started"
+        || first_word == b"completed"
+        || first_word == b"failed"
+        || first_word == b"start"
+        || first_word == b"fail"
+    {
+        name_start = first_word_end;
+        while name_start < lower_len && (lower_buf[name_start] == b' ' || lower_buf[name_start] == b'\t') {
+            name_start += 1;
+        }
     }
-    while hi > lo && (name_slice[hi - 1] == b' ' || name_slice[hi - 1] == b'\t') {
-        hi -= 1;
+
+    let mut name_end = name_start;
+    while name_end < lower_len
+        && lower_buf[name_end] != b' '
+        && lower_buf[name_end] != b'\t'
+        && lower_buf[name_end] != b'\r'
+        && lower_buf[name_end] != b'\n'
+    {
+        name_end += 1;
     }
-    let trimmed_name = &name_slice[lo..hi];
-    if trimmed_name.is_empty() {
+
+    if name_start >= name_end {
         return None;
     }
+
+    let name_bytes = &buf[i + name_start..i + name_end];
 
     let mut duration_ms = None;
-    let mut final_name = trimmed_name;
-    if trimmed_name.ends_with(b"ms") {
-        let body = &trimmed_name[..trimmed_name.len() - 2];
-        let mut body_end = body.len();
-        while body_end > 0 && (body[body_end - 1] == b' ' || body[body_end - 1] == b'\t') {
-            body_end -= 1;
+    if let Some(in_idx) = memchr::memmem::find(&lower_buf, b"in ") {
+        let after_in = in_idx + 3;
+        let mut d_end = after_in;
+        while d_end < lower_len && lower_buf[d_end].is_ascii_digit() {
+            d_end += 1;
         }
-        let trimmed_body = &body[..body_end];
-        if let Some(sp) = trimmed_body.iter().rposition(|&c| c == b' ' || c == b'\t') {
-            let num = &trimmed_body[sp + 1..];
-            let name_part = &trimmed_body[..sp];
-            if !name_part.is_empty() {
-                if let Some((v, consumed)) = parse_float(num, 0, num.len()) {
-                    if consumed == num.len() {
-                        final_name = name_part;
-                        duration_ms = Some(v);
-                    }
+        if d_end > after_in {
+            if let Ok(s) = std::str::from_utf8(&lower_buf[after_in..d_end]) {
+                if let Ok(val) = s.parse::<f32>() {
+                    duration_ms = Some(val);
+                }
+            }
+        }
+    } else if let Some(after_idx) = memchr::memmem::find(&lower_buf, b"after ") {
+        let after_after = after_idx + 6;
+        let mut d_end = after_after;
+        while d_end < lower_len && lower_buf[d_end].is_ascii_digit() {
+            d_end += 1;
+        }
+        if d_end > after_after {
+            if let Ok(s) = std::str::from_utf8(&lower_buf[after_after..d_end]) {
+                if let Ok(val) = s.parse::<f32>() {
+                    duration_ms = Some(val);
                 }
             }
         }
     }
 
+    let event = if is_failed {
+        2
+    } else if is_completed {
+        1
+    } else {
+        0
+    };
+
     Some(LineKind::Cron {
         event,
-        name: final_name,
+        name: name_bytes,
         duration_ms,
     })
 }
 
-pub fn parse_line_bytes<'a>(buf: &'a [u8], start: usize, mut end: usize) -> LineKind<'a> {
-    if end > start && buf[end - 1] == b'\r' {
-        end -= 1;
-    }
-    if end <= start {
+pub fn parse_line_bytes(line: &[u8]) -> LineKind<'_> {
+    let i = skip_space_ansi(line, 0, line.len());
+    if i >= line.len() {
         return LineKind::Empty;
     }
 
-    // Fast Path 1: Try HTTP Format A first (matches >95% of requests instantly)
-    if let Some(k) = try_http_a(buf, start, end) {
-        return k;
-    }
-
-    // Fast Path 2: Try HTTP Format B
-    if let Some(k) = try_http_b(buf, start, end) {
-        return k;
-    }
-
-    // Fallback: Check if empty or whitespace only
-    if !has_non_space(buf, start, end) {
-        return LineKind::Empty;
-    }
-
-    // Fallback: Check for Cron events
-    if find_cron_mark(buf, start, end).is_some() {
-        if let Some(k) = try_cron(buf, start, end) {
-            return k;
+    let mut prefix_dur: Option<f32> = None;
+    let (cur_i, hour) = if let Some((after_ts, h)) = skip_timestamp(line, i, line.len()) {
+        (after_ts, h)
+    } else if let Some((dur, after_dur)) = parse_f32_fast(line, i, line.len()) {
+        let post_dur = skip_space_ansi(line, after_dur, line.len());
+        if post_dur + 1 < line.len()
+            && (line[post_dur] == b'm' || line[post_dur] == b'M')
+            && (line[post_dur + 1] == b's' || line[post_dur + 1] == b'S')
+        {
+            prefix_dur = Some(dur);
+            (skip_space_ansi(line, post_dur + 2, line.len()), None)
+        } else {
+            (i, None)
         }
+    } else {
+        (i, None)
+    };
+
+    if let Some(cron) = parse_cron_line(line, cur_i, line.len()) {
+        return cron;
     }
 
-    LineKind::Unmatched(&buf[start..end])
-}
+    let (method, after_m) = match parse_method(line, cur_i, line.len()) {
+        Some(res) => res,
+        None => return LineKind::Unmatched(line),
+    };
 
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn http_a() {
-        let s = b"2026-07-24T00:00:10: GET /api/health 200 12.5 ms - 42";
-        match parse_line_bytes(s, 0, s.len()) {
-            LineKind::Http {
-                method,
-                path,
-                status,
-                duration_ms,
-            } => {
-                assert_eq!(method, Method::Get);
-                assert_eq!(path, b"/api/health");
-                assert_eq!(status, 200);
-                assert!((duration_ms - 12.5).abs() < 0.01);
-            }
-            other => panic!("unexpected {other:?}"),
+    let p_start = skip_space_ansi(line, after_m, line.len());
+    let mut p_end = p_start;
+    while p_end < line.len() {
+        let c = line[p_end];
+        if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' || c == 0x1b {
+            break;
         }
+        p_end += 1;
+    }
+    if p_start >= p_end {
+        return LineKind::Unmatched(line);
+    }
+    let path = &line[p_start..p_end];
+
+    let (status, after_s) = match parse_u16_fast(line, p_end, line.len()) {
+        Some(res) => res,
+        None => (200, p_end),
+    };
+
+    let (dur, after_dur) = match parse_f32_fast(line, after_s, line.len()) {
+        Some(res) => res,
+        None => (prefix_dur.unwrap_or(0.0), after_s),
+    };
+
+    let post_dur = skip_space_ansi(line, after_dur, line.len());
+    let (clean_dur, final_i) = if prefix_dur.is_some() {
+        (prefix_dur.unwrap(), after_s)
+    } else if post_dur < line.len()
+        && (line[post_dur] == b'm' || line[post_dur] == b'M')
+        && post_dur + 1 < line.len()
+        && (line[post_dur + 1] == b's' || line[post_dur + 1] == b'S')
+    {
+        (dur, post_dur + 2)
+    } else if post_dur < line.len()
+        && (line[post_dur] == b's' || line[post_dur] == b'S')
+    {
+        (dur * 1000.0, post_dur + 1)
+    } else {
+        (dur, after_dur)
+    };
+
+    let rest = skip_space_ansi(line, final_i, line.len());
+    let rest_valid = rest >= line.len() || line[rest] == b'-' || line[rest] == b'/' || is_digit(line[rest]);
+
+    if !rest_valid {
+        return LineKind::Unmatched(line);
     }
 
-    #[test]
-    fn http_a_ansi() {
-        let s = b"\x1b[0mPOST /api/admin/dashboard \x1b[32m200\x1b[0m 71.197 ms - 223\x1b[0m";
-        match parse_line_bytes(s, 0, s.len()) {
-            LineKind::Http {
-                method,
-                path,
-                status,
-                duration_ms,
-            } => {
-                assert_eq!(method, Method::Post);
-                assert_eq!(path, b"/api/admin/dashboard");
-                assert_eq!(status, 200);
-                assert!((duration_ms - 71.197).abs() < 0.01);
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-
-    #[test]
-    fn http_b() {
-        let s = b"68064.174ms\tPOST /api/admin/user/getuserbyrole";
-        match parse_line_bytes(s, 0, s.len()) {
-            LineKind::Http {
-                method,
-                path,
-                duration_ms,
-                ..
-            } => {
-                assert_eq!(method, Method::Post);
-                assert_eq!(path, b"/api/admin/user/getuserbyrole");
-                assert!((duration_ms - 68064.174).abs() < 0.01);
-            }
-            other => panic!("unexpected {other:?}"),
-        }
+    LineKind::Http {
+        method,
+        path,
+        status,
+        duration_ms: clean_dur,
+        hour,
     }
 }

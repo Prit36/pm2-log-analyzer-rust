@@ -1,0 +1,1 @@
+- Prefers discarding unwanted unpushed commits entirely via `git reset --hard origin/master` to leave branch matching origin with nothing to push and a clean working tree, rather than soft reset keeping changes or adding revert commits. Confidence: 0.8

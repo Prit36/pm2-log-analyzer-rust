@@ -237,6 +237,7 @@ mod tests {
                 method: Method::Get,
                 total_calls: 100,
                 error_calls: 2,
+                failed_calls: 2,
                 total_duration_ms: 5000.0,
                 min_duration_ms: 10.0,
                 max_duration_ms: 120.0,
@@ -251,6 +252,7 @@ mod tests {
                 method: Method::Post,
                 total_calls: 50,
                 error_calls: 0,
+                failed_calls: 0,
                 total_duration_ms: 4000.0,
                 min_duration_ms: 5.0,
                 max_duration_ms: 200.0,
@@ -264,12 +266,17 @@ mod tests {
         s.cron_jobs = vec![CronStats {
             name: "daily-report".into(),
             total_runs: 30,
+            starts: 28,
             total_success: 28,
+            failed_runs: 2,
             total_failures: 2,
             total_duration_ms: 9000.0,
             avg_duration_ms: 300.0,
             min_duration_ms: 250.0,
             max_duration_ms: 400.0,
+            p95_ms: 380.0,
+            p99_ms: 395.0,
+            last_duration_ms: 310.0,
             last_status: "completed".into(),
         }];
         s

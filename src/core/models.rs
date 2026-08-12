@@ -81,7 +81,7 @@ impl Default for StatusFamily {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FilterOptions {
     pub method: Option<Method>,
     pub status_family: StatusFamily,
@@ -104,12 +104,13 @@ impl Default for FilterOptions {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EndpointStats {
     pub path: String,
     pub method: Method,
     pub total_calls: u64,
     pub error_calls: u64,
+    pub failed_calls: u64,
     pub total_duration_ms: f64,
     pub min_duration_ms: f32,
     pub max_duration_ms: f32,
@@ -138,20 +139,38 @@ impl EndpointStats {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CronStats {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CronJobStats {
     pub name: String,
     pub total_runs: u64,
+    pub starts: u64,
     pub total_success: u64,
+    pub failed_runs: u64,
     pub total_failures: u64,
     pub total_duration_ms: f64,
     pub avg_duration_ms: f64,
     pub min_duration_ms: f32,
     pub max_duration_ms: f32,
+    pub p95_ms: f32,
+    pub p99_ms: f32,
+    pub last_duration_ms: f32,
     pub last_status: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+pub type CronStats = CronJobStats;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HourlyBucket {
+    pub hour: u8,
+    pub label: String,
+    pub count: u64,
+    pub error_count: u64,
+    pub avg_ms: f32,
+    pub p95_ms: f32,
+    pub p99_ms: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogAnalysisSummary {
     pub total_file_size_bytes: u64,
     pub total_lines_parsed: u64,
@@ -167,7 +186,32 @@ pub struct LogAnalysisSummary {
     pub overall_error_rate: f64,
     pub endpoints: Vec<EndpointStats>,
     pub cron_jobs: Vec<CronStats>,
+    pub hourly_buckets: Vec<HourlyBucket>,
     pub unmatched_samples: Vec<String>,
+}
+
+impl LogAnalysisSummary {
+    pub fn avg_latency_ms(&self) -> f32 {
+        let total_calls: u64 = self.endpoints.iter().map(|e| e.total_calls).sum();
+        let total_dur: f64 = self.endpoints.iter().map(|e| e.total_duration_ms).sum();
+        if total_calls > 0 {
+            (total_dur / total_calls as f64) as f32
+        } else {
+            0.0
+        }
+    }
+
+    pub fn p95_latency_ms(&self) -> f32 {
+        self.overall_p95_ms
+    }
+
+    pub fn error_responses(&self) -> u64 {
+        self.overall_error_count
+    }
+
+    pub fn slow_requests_3s(&self) -> u64 {
+        self.endpoints.iter().map(|e| if e.max_duration_ms >= 3000.0 { e.total_calls } else { 0 }).sum()
+    }
 }
 
 impl Default for LogAnalysisSummary {
@@ -187,7 +231,41 @@ impl Default for LogAnalysisSummary {
             overall_error_rate: 0.0,
             endpoints: Vec::new(),
             cron_jobs: Vec::new(),
+            hourly_buckets: Vec::new(),
             unmatched_samples: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortColumn {
+    Path,
+    Method,
+    Calls,
+    ErrorRate,
+    AvgDuration,
+    P50,
+    P95,
+    P99,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableSortState {
+    pub column: SortColumn,
+    pub direction: SortDirection,
+}
+
+impl Default for TableSortState {
+    fn default() -> Self {
+        Self {
+            column: SortColumn::P95,
+            direction: SortDirection::Descending,
         }
     }
 }

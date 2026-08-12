@@ -21,7 +21,7 @@ pub struct PackedEntry {
     pub duration: f32,
     pub status: u16,
     pub method: u8,
-    pub _pad: u8,
+    pub hour: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -275,6 +275,7 @@ impl Engine {
 
                 let mut local_http_count = 0u64;
                 let mut local_error_count = 0u64;
+                let mut local_hourly = vec![HourlyAcc::default(); 24];
 
                 if is_unfiltered {
                     for entry in chunk {
@@ -284,6 +285,16 @@ impl Engine {
                         let is_err = entry.status >= 400;
                         if is_err {
                             local_error_count += 1;
+                        }
+
+                        if entry.hour < 24 {
+                            let h = &mut local_hourly[entry.hour as usize];
+                            h.count += 1;
+                            if is_err {
+                                h.error_count += 1;
+                            }
+                            h.sum_ms += entry.duration as f64;
+                            h.sketch.accept(entry.duration);
                         }
 
                         if use_direct_array {
@@ -391,8 +402,19 @@ impl Engine {
                         }
 
                         local_http_count += 1;
-                        if entry.status >= 400 {
+                        let is_err = entry.status >= 400;
+                        if is_err {
                             local_error_count += 1;
+                        }
+
+                        if entry.hour < 24 {
+                            let h = &mut local_hourly[entry.hour as usize];
+                            h.count += 1;
+                            if is_err {
+                                h.error_count += 1;
+                            }
+                            h.sum_ms += entry.duration as f64;
+                            h.sketch.accept(entry.duration);
                         }
 
                         let slot_idx = (norm_id * 8) + (method_u8 as u32);
@@ -466,6 +488,7 @@ impl Engine {
                     overall_sketch: local_sketch,
                     http_count: local_http_count,
                     error_count: local_error_count,
+                    hourly: local_hourly,
                 }
             })
             .collect();
@@ -475,11 +498,21 @@ impl Engine {
         let mut overall_sketch = RelHist::new();
         let mut filtered_http_count = 0u64;
         let mut filtered_error_count = 0u64;
+        let mut global_hourly = vec![HourlyAcc::default(); 24];
 
         for res in chunk_results {
             overall_sketch.merge(&res.overall_sketch);
             filtered_http_count += res.http_count;
             filtered_error_count += res.error_count;
+
+            for (h_idx, acc) in res.hourly.into_iter().enumerate() {
+                if h_idx < 24 {
+                    global_hourly[h_idx].count += acc.count;
+                    global_hourly[h_idx].error_count += acc.error_count;
+                    global_hourly[h_idx].sum_ms += acc.sum_ms;
+                    global_hourly[h_idx].sketch.merge(&acc.sketch);
+                }
+            }
 
             for (idx, chunk_acc) in res.slots {
                 match global_slots.get_mut(&idx) {
@@ -557,6 +590,7 @@ impl Engine {
                     method,
                     total_calls: acc.total_calls,
                     error_calls: acc.error_calls,
+                    failed_calls: acc.error_calls,
                     total_duration_ms: acc.total_duration_ms,
                     min_duration_ms: if acc.min_duration_ms == f32::MAX {
                         0.0
@@ -583,7 +617,9 @@ impl Engine {
             .map(|(name, acc)| CronStats {
                 name,
                 total_runs: acc.total_runs,
+                starts: acc.total_success,
                 total_success: acc.total_success,
+                failed_runs: acc.total_failures,
                 total_failures: acc.total_failures,
                 total_duration_ms: acc.total_duration_ms,
                 avg_duration_ms: if acc.total_runs > 0 {
@@ -601,6 +637,9 @@ impl Engine {
                 } else {
                     acc.max_duration_ms
                 },
+                p95_ms: 0.0,
+                p99_ms: 0.0,
+                last_duration_ms: if acc.max_duration_ms == f32::MIN { 0.0 } else { acc.max_duration_ms },
                 last_status: acc.last_status,
             })
             .collect();
@@ -610,6 +649,27 @@ impl Engine {
         } else {
             0.0
         };
+
+        let hourly_buckets: Vec<crate::core::models::HourlyBucket> = global_hourly
+            .into_iter()
+            .enumerate()
+            .map(|(hour, acc)| {
+                let avg_ms = if acc.count > 0 {
+                    (acc.sum_ms / acc.count as f64) as f32
+                } else {
+                    0.0
+                };
+                crate::core::models::HourlyBucket {
+                    hour: hour as u8,
+                    label: format!("{:02}:00", hour),
+                    count: acc.count,
+                    error_count: acc.error_count,
+                    avg_ms,
+                    p95_ms: acc.sketch.quantile(0.95),
+                    p99_ms: acc.sketch.quantile(0.99),
+                }
+            })
+            .collect();
 
         LogAnalysisSummary {
             total_file_size_bytes: file_size,
@@ -626,6 +686,7 @@ impl Engine {
             overall_error_rate: error_rate,
             endpoints,
             cron_jobs,
+            hourly_buckets,
             unmatched_samples: self.unmatched_samples.clone(),
         }
     }
@@ -757,7 +818,7 @@ pub fn parse_log_buffer(buffer: &[u8]) -> Engine {
                     duration: entry.duration,
                     status: entry.status,
                     method: entry.method,
-                    _pad: 0,
+                    hour: entry.hour,
                 })
                 .collect()
         })
@@ -818,13 +879,14 @@ fn parse_chunk(chunk: &[u8]) -> Engine {
 
     for end in newlines {
         engine.total_lines += 1;
-        match parse_line_bytes(chunk, start, end) {
+        match parse_line_bytes(&chunk[start..end]) {
             LineKind::Empty => {}
             LineKind::Http {
                 method,
                 path,
                 status,
                 duration_ms,
+                hour,
             } => {
                 let (h1, h2) = path_fingerprint(path);
                 let slot_idx = (h1 & l1_mask) as usize;
@@ -880,7 +942,7 @@ fn parse_chunk(chunk: &[u8]) -> Engine {
                     duration: duration_ms,
                     status,
                     method: method as u8,
-                    _pad: 0,
+                    hour: hour.unwrap_or(255),
                 });
             }
             LineKind::Cron {
@@ -913,13 +975,14 @@ fn parse_chunk(chunk: &[u8]) -> Engine {
     // Trailing line without a final newline (or empty tail after last \n)
     if start < chunk.len() {
         engine.total_lines += 1;
-        match parse_line_bytes(chunk, start, chunk.len()) {
+        match parse_line_bytes(&chunk[start..]) {
             LineKind::Empty => {}
             LineKind::Http {
                 method,
                 path,
                 status,
                 duration_ms,
+                hour,
             } => {
                 let (h1, h2) = path_fingerprint(path);
                 let slot_idx = (h1 & l1_mask) as usize;
@@ -971,7 +1034,7 @@ fn parse_chunk(chunk: &[u8]) -> Engine {
                     duration: duration_ms,
                     status,
                     method: method as u8,
-                    _pad: 0,
+                    hour: hour.unwrap_or(255),
                 });
             }
             LineKind::Cron {
@@ -1019,11 +1082,20 @@ fn strip_ansi_bytes(buf: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(out)
 }
 
+#[derive(Clone, Default)]
+struct HourlyAcc {
+    count: u64,
+    error_count: u64,
+    sum_ms: f64,
+    sketch: RelHist,
+}
+
 struct ChunkResult {
     slots: FastHashMap<u32, EndpointAcc>,
     overall_sketch: RelHist,
     http_count: u64,
     error_count: u64,
+    hourly: Vec<HourlyAcc>,
 }
 
 #[derive(Clone, Debug, Default)]

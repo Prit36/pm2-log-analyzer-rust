@@ -16,10 +16,15 @@ path = "src/main.rs"
 name = "bench"
 path = "src/bin/bench.rs"
 
+[[bin]]
+name = "parity_runner"
+path = "src/bin/parity_runner.rs"
+
 [dependencies]
-eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts"] }
-egui = { version = "0.31", default-features = false }
-egui_plot = { version = "0.31", default-features = false }
+dioxus = { version = "0.6", features = ["desktop"] }
+dioxus-desktop = "0.6"
+tokio = { version = "1.40", features = ["rt-multi-thread", "time", "sync"] }
+arboard = "3.4"
 rayon = "1.12"
 memmap2 = "0.9"
 memchr = "2.8"

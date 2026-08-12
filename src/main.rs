@@ -1,24 +1,19 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // Hide console window on Windows release builds
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use eframe::NativeOptions;
-use pm2_log_analyzer::app::Pm2App;
+use dioxus::prelude::*;
+use dioxus_desktop::{Config, LogicalSize, WindowBuilder};
+use pm2_log_analyzer::app::App;
 
-fn main() -> eframe::Result<()> {
-    let native_options = NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("PM2 Log Analyzer Native - Pure Rust Ops Console")
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([900.0, 600.0])
-            .with_resizable(true),
-        multisampling: 0,
-        vsync: true,
-        ..Default::default()
-    };
+fn main() {
+    let window = WindowBuilder::new()
+        .with_title("PM2 Log Analyzer")
+        .with_inner_size(LogicalSize::new(1280.0, 850.0))
+        .with_min_inner_size(LogicalSize::new(900.0, 600.0))
+        .with_resizable(true);
 
-    eframe::run_native(
-        "PM2 Log Analyzer Native",
-        native_options,
-        Box::new(|cc| Ok(Box::new(Pm2App::new(cc)))),
-    )
+    let config = Config::new().with_window(window);
+
+    LaunchBuilder::new()
+        .with_cfg(config)
+        .launch(App);
 }
-
