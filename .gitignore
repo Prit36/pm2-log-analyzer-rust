@@ -6,3 +6,9 @@
 *.sln.docstates
 .DS_Store
 *.log
+node_modules/
+node_modules/
+parity/out/
+visual-tests/candidates/
+visual-tests/diffs/
+visual-tests/reports/

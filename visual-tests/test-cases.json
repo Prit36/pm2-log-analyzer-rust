@@ -1,0 +1,54 @@
+{
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  },
+  "regions": [
+    "header",
+    "ingest-panel",
+    "kpi-row",
+    "filter-bar",
+    "api-table",
+    "latency-chart",
+    "cron-table",
+    "skipped-disclosure"
+  ],
+  "cases": [
+    {
+      "id": "empty_light",
+      "name": "Empty State (Light Theme)",
+      "theme": "light",
+      "action": "none"
+    },
+    {
+      "id": "empty_dark",
+      "name": "Empty State (Dark Theme)",
+      "theme": "dark",
+      "action": "none"
+    },
+    {
+      "id": "paste_open",
+      "name": "Paste Drawer Open",
+      "theme": "light",
+      "action": "open_paste"
+    },
+    {
+      "id": "populated_light",
+      "name": "Populated Logs (Light Theme)",
+      "theme": "light",
+      "action": "paste_logs"
+    },
+    {
+      "id": "populated_dark",
+      "name": "Populated Logs (Dark Theme)",
+      "theme": "dark",
+      "action": "paste_logs"
+    },
+    {
+      "id": "filtered_4xx",
+      "name": "Filtered 4xx Status",
+      "theme": "light",
+      "action": "filter_4xx"
+    }
+  ]
+}

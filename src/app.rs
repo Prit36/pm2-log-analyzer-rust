@@ -1,272 +1,132 @@
+//! App shell — port of `src/App.tsx` + `src/components/Pm2AppView.tsx`.
+
 use dioxus::prelude::*;
-use crate::core::aggregator::{parse_log_buffer, Engine};
-use crate::core::mmap::MmapReader;
-use crate::core::models::{EndpointStats, FilterOptions, LogAnalysisSummary};
-use crate::ui::*;
-use std::path::PathBuf;
-use std::sync::Arc;
+
+use crate::core::models::{AggregatedEndpoint, CronAggregated};
+use crate::store::{
+    install_window_size, restore_persisted, use_analysis_store, AppMode, AppModeStore, AnalysisStore,
+    ChartLayout,
+};
+use crate::ui::api_table::ApiTable;
+use crate::ui::charts::LatencyChart;
+use crate::ui::cron_table::CronTable;
+use crate::ui::filters::FilterBar;
+use crate::ui::header::AppHeader;
+use crate::ui::ingest::IngestPanel;
+use crate::ui::kpi::KpiRow;
+use crate::ui::skipped::SkippedDisclosure;
+use crate::ui::toast::Toast;
+use crate::utils::table_ops::{filter_api_endpoints, sort_api_endpoints, sort_cron_jobs};
 
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 
+const SEARCH_SHORTCUT_SCRIPT: &str = r#"
+window.addEventListener('keydown', function (e) {
+  if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+  const input = document.querySelector('input[data-filter-search]');
+  if (input) { e.preventDefault(); input.focus(); }
+});
+"#;
+
 #[component]
 pub fn App() -> Element {
-    let theme = use_signal(|| "light".to_string());
-    let mut source_kind = use_signal(|| "none".to_string());
-    let mut file_name = use_signal(|| None::<String>);
-    let mut file_size = use_signal(|| 0u64);
-    let mut has_data = use_signal(|| false);
-    let mut is_parsing = use_signal(|| false);
-    let mut progress_percent = use_signal(|| 0u32);
-    let mut status_msg = use_signal(|| "Ready".to_string());
+    let analysis = use_context_provider(AnalysisStore::new);
+    let app_mode = use_context_provider(AppModeStore::new);
 
-    let mut engine = use_signal(|| None::<Arc<Engine>>);
-    let mut summary = use_signal(|| LogAnalysisSummary::default());
-    let mut sorted_endpoints = use_signal(|| Vec::<EndpointStats>::new());
-
-    let filters = use_signal(|| FilterOptions::default());
-    let sort_key = use_signal(|| "p95Ms".to_string());
-    let top_n = use_signal(|| 50usize);
-    let selected_methods = use_signal(|| Vec::<String>::new());
-
-    let mut cron_jobs = use_signal(|| Vec::<crate::core::models::CronJobStats>::new());
-    let mut unmatched_count = use_signal(|| 0u64);
-    let mut unmatched_samples = use_signal(|| Vec::<String>::new());
-
-    let mut toast_msg = use_signal(|| None::<String>);
-
-    let mut show_toast = move |msg: String| {
-        toast_msg.set(Some(msg));
-        spawn(async move {
-            tokio_time_sleep().await;
-            toast_msg.set(None);
-        });
-    };
-
-    let mut recompute = move || {
-        if let Some(ref eng) = *engine.read() {
-            let f = filters();
-            let sum = eng.aggregate(file_size(), 0, &f);
-            let mut sorted = sum.endpoints.clone();
-            
-            let sel_m = selected_methods();
-            if !sel_m.is_empty() {
-                sorted.retain(|e| sel_m.contains(&e.method.as_str().to_string()));
-            }
-
-            let sk = sort_key();
-            sorted.sort_by(|a, b| {
-                let cmp = match sk.as_str() {
-                    "count" => b.total_calls.cmp(&a.total_calls),
-                    "avgMs" => b.avg_duration_ms().partial_cmp(&a.avg_duration_ms()).unwrap_or(std::cmp::Ordering::Equal),
-                    "maxMs" => b.max_duration_ms.partial_cmp(&a.max_duration_ms).unwrap_or(std::cmp::Ordering::Equal),
-                    "p99Ms" => b.p99_ms.partial_cmp(&a.p99_ms).unwrap_or(std::cmp::Ordering::Equal),
-                    "errorCount" => b.failed_calls.cmp(&a.failed_calls),
-                    _ => b.p95_ms.partial_cmp(&a.p95_ms).unwrap_or(std::cmp::Ordering::Equal),
-                };
-                cmp
-            });
-
-            sorted.truncate(top_n());
-            cron_jobs.set(sum.cron_jobs.clone());
-            unmatched_count.set(sum.unmatched_lines as u64);
-            unmatched_samples.set(sum.unmatched_samples.clone());
-            sorted_endpoints.set(sorted);
-            summary.set(sum);
+    use_future(move || async move {
+        restore_persisted(analysis).await;
+    });
+    use_future(move || async move {
+        crate::store::app_mode_store::restore_persisted_mode(app_mode).await;
+        let _ = document::eval(SEARCH_SHORTCUT_SCRIPT);
+        install_window_size(analysis).await;
+        // Test hook: load a log file at startup (`PM2_ANALYZER_AUTOLOAD=<path>`).
+        if let Ok(path) = std::env::var("PM2_ANALYZER_AUTOLOAD") {
+            crate::store::handle_log_files_upload(
+                analysis,
+                vec![crate::core::pm2::LoadedSource::Path(std::path::PathBuf::from(path))],
+                false,
+            );
         }
-    };
+    });
 
-    let mut load_file = move |path: PathBuf| {
-        is_parsing.set(true);
-        progress_percent.set(20);
-        status_msg.set(format!("Opening {}", path.display()));
-        source_kind.set("file".to_string());
-        file_name.set(Some(path.file_name().unwrap_or_default().to_string_lossy().to_string()));
-
-        let f_opts = filters();
-
-        spawn(async move {
-            let res = tokio::task::spawn_blocking(move || {
-                let start = std::time::Instant::now();
-                if let Ok(reader) = MmapReader::open(&path) {
-                    let f_size = reader.len() as u64;
-                    let eng = parse_log_buffer(reader.as_slice());
-                    let elapsed_ms = start.elapsed().as_millis() as u64;
-                    let sum = eng.aggregate(f_size, elapsed_ms, &f_opts);
-
-                    let arc_eng = Arc::new(eng);
-                    let mut sorted = sum.endpoints.clone();
-                    sorted.sort_by(|a, b| b.p95_ms.partial_cmp(&a.p95_ms).unwrap_or(std::cmp::Ordering::Equal));
-                    sorted.truncate(50);
-
-                    Ok((f_size, arc_eng, sum, sorted, elapsed_ms))
-                } else {
-                    Err("Failed to open file".to_string())
-                }
-            }).await;
-
-            match res {
-                Ok(Ok((f_size, arc_eng, sum, sorted, elapsed_ms))) => {
-                    file_size.set(f_size);
-                    engine.set(Some(arc_eng));
-                    cron_jobs.set(sum.cron_jobs.clone());
-                    unmatched_count.set(sum.unmatched_lines as u64);
-                    unmatched_samples.set(sum.unmatched_samples.clone());
-                    summary.set(sum);
-                    sorted_endpoints.set(sorted);
-                    has_data.set(true);
-                    is_parsing.set(false);
-                    progress_percent.set(100);
-                    status_msg.set(format!("Parsed in {} ms", elapsed_ms));
-                }
-                _ => {
-                    is_parsing.set(false);
-                    status_msg.set("Failed to open file".to_string());
-                }
-            }
-        });
-    };
-
-    let mut analyze_paste = move |text: String| {
-        is_parsing.set(true);
-        progress_percent.set(30);
-        status_msg.set("Analyzing pasted text...".to_string());
-        source_kind.set("paste".to_string());
-        file_name.set(None);
-        let f_size_val = text.len() as u64;
-        file_size.set(f_size_val);
-
-        let f_opts = filters();
-
-        spawn(async move {
-            let res = tokio::task::spawn_blocking(move || {
-                let start = std::time::Instant::now();
-                let eng = parse_log_buffer(text.as_bytes());
-                let elapsed_ms = start.elapsed().as_millis() as u64;
-                let sum = eng.aggregate(text.len() as u64, elapsed_ms, &f_opts);
-
-                let arc_eng = Arc::new(eng);
-                let mut sorted = sum.endpoints.clone();
-                sorted.sort_by(|a, b| b.p95_ms.partial_cmp(&a.p95_ms).unwrap_or(std::cmp::Ordering::Equal));
-                sorted.truncate(50);
-
-                (arc_eng, sum, sorted, elapsed_ms)
-            }).await;
-
-            if let Ok((arc_eng, sum, sorted, elapsed_ms)) = res {
-                engine.set(Some(arc_eng));
-                cron_jobs.set(sum.cron_jobs.clone());
-                unmatched_count.set(sum.unmatched_lines as u64);
-                unmatched_samples.set(sum.unmatched_samples.clone());
-                summary.set(sum);
-                sorted_endpoints.set(sorted);
-                has_data.set(true);
-                is_parsing.set(false);
-                progress_percent.set(100);
-                status_msg.set(format!("Parsed paste in {} ms", elapsed_ms));
-            } else {
-                is_parsing.set(false);
-                status_msg.set("Failed to analyze paste".to_string());
-            }
-        });
-    };
-
-    let clear_all = move |_| {
-        source_kind.set("none".to_string());
-        file_name.set(None);
-        file_size.set(0);
-        has_data.set(false);
-        engine.set(None);
-        summary.set(LogAnalysisSummary::default());
-        sorted_endpoints.set(Vec::new());
-        cron_jobs.set(Vec::new());
-        unmatched_count.set(0);
-        unmatched_samples.set(Vec::new());
-        is_parsing.set(false);
-        show_toast("Cleared loaded log data".to_string());
-    };
-
-    let is_dark = theme() == "dark";
+    let mode = app_mode.mode();
 
     rsx! {
         style { "{STYLE_CSS}" }
-        div { class: if is_dark { "dark min-h-full bg-[#0b0f19] text-slate-100 font-sans" } else { "min-h-full bg-[#f7f8fa] text-slate-900 font-sans" },
-            AppHeader {
-                theme: theme,
-                source_kind: source_kind,
-                file_name: file_name,
-                file_size: file_size,
-                has_data: has_data,
-                is_parsing: is_parsing,
-                summary: summary,
-                on_toast: move |msg| show_toast(msg),
-                on_clear: clear_all,
+        document::Link { rel: "preconnect", href: "https://fonts.googleapis.com" }
+        document::Link { rel: "preconnect", href: "https://fonts.gstatic.com", crossorigin: "anonymous" }
+        document::Link { rel: "stylesheet", href: "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" }
+        div { class: "min-h-full",
+            AppHeader {}
+            main { class: "mx-auto flex max-w-7xl flex-col gap-4 px-4 py-4",
+                if mode == AppMode::Mongo {
+                    crate::ui::mongo::MongoAppView {}
+                } else {
+                    Pm2AppView {}
+                }
             }
-            main { class: "mx-auto max-w-7xl space-y-4 px-4 py-4",
-                IngestPanel {
-                    has_data: has_data,
-                    is_parsing: is_parsing,
-                    progress_percent: progress_percent,
-                    on_file_select: move |path| load_file(path),
-                    on_paste_analyze: move |text| analyze_paste(text),
-                    on_toast: move |msg| show_toast(msg),
-                }
+            Toast {}
+        }
+    }
+}
 
-                KpiRow {
-                    has_data: has_data,
-                    summary: summary,
-                }
+#[component]
+pub fn Pm2AppView() -> Element {
+    let store = use_analysis_store();
+    let api_rows = use_filtered_api_rows();
+    let cron_rows = use_filtered_cron_rows();
+    let has_cron = store.has_cron_events();
+    let layout = store.chart_layout();
 
-                FilterBar {
-                    has_data: has_data,
-                    filters: filters,
-                    sort_key: sort_key,
-                    top_n: top_n,
-                    selected_methods: selected_methods,
-                    on_filter_change: move |_| recompute(),
+    rsx! {
+        div { class: "flex flex-col gap-4",
+            IngestPanel {}
+            KpiRow {}
+            FilterBar {}
+            if layout == ChartLayout::Wide {
+                div { class: "flex flex-col gap-4",
+                    LatencyChart { rows: api_rows.clone() }
+                    ApiTable { rows: api_rows }
                 }
-
+            } else {
                 div { class: "grid gap-4 lg:grid-cols-5",
                     div { class: "lg:col-span-3",
-                        ApiTable {
-                            endpoints: sorted_endpoints,
-                            on_toast: move |msg| show_toast(msg),
-                        }
+                        ApiTable { rows: api_rows.clone() }
                     }
                     div { class: "lg:col-span-2",
-                        LatencyChart {
-                            has_data: has_data,
-                            summary: summary,
-                            endpoints: sorted_endpoints,
-                            theme: theme,
-                        }
+                        LatencyChart { rows: api_rows }
                     }
                 }
-
-                CronTable {
-                    jobs: cron_jobs,
-                    on_toast: move |msg| show_toast(msg),
-                }
-
-                SkippedDisclosure {
-                    unmatched_count: unmatched_count,
-                    samples: unmatched_samples,
-                    has_data: has_data,
-                }
-
-                footer { class: "pb-6 pt-2 text-center text-[11px] text-slate-400 dark:text-slate-500",
-                    "Parses in your native Windows engine - logs never leave this machine"
-                }
             }
-            Toast {
-                toast_msg: toast_msg,
+            if has_cron {
+                CronTable { rows: cron_rows }
+            }
+            SkippedDisclosure {}
+            footer { class: "pb-6 pt-2 text-center text-[11px] text-slate-400",
+                "Parses in your browser - logs never leave this machine"
             }
         }
     }
 }
 
-async fn tokio_time_sleep() {
-    #[cfg(target_arch = "wasm32")]
-    gloo_timers::future::TimeoutFuture::new(3000).await;
-    #[cfg(not(target_arch = "wasm32"))]
-    tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+fn use_filtered_api_rows() -> Vec<AggregatedEndpoint> {
+    let store = use_analysis_store();
+    let filters = store.filters();
+    let api = store
+        .result()
+        .map(|r| r.api)
+        .unwrap_or_default();
+    let filtered = filter_api_endpoints(&api, &filters.methods, &filters.query);
+    let sorted = sort_api_endpoints(&filtered, filters.sort_key, filters.sort_dir);
+    sorted.into_iter().take(filters.top_n).collect()
+}
+
+fn use_filtered_cron_rows() -> Vec<CronAggregated> {
+    let store = use_analysis_store();
+    let filters = store.filters();
+    let cron = store.result().map(|r| r.cron).unwrap_or_default();
+    sort_cron_jobs(&cron, filters.cron_sort_key, filters.cron_sort_dir)
 }

@@ -1,63 +1,40 @@
+//! `ApiTable` — port of `src/components/ApiTable.tsx`.
+
 use dioxus::prelude::*;
-use crate::core::models::EndpointStats;
 
-fn format_num(val: u64) -> String {
-    let s = val.to_string();
-    let mut result = String::new();
-    let len = s.len();
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
-            result.push(',');
+use crate::core::models::AggregatedEndpoint;
+use crate::store::{show_toast, use_analysis_store, ApiSortKey, SortDirection};
+use crate::ui::icons::Icon;
+use crate::utils::cn::cn;
+use crate::utils::format::{format_ms, format_num};
+use crate::utils::table_ops::{build_api_tsv, copy_to_clipboard};
+
+fn method_class(method: &str) -> &'static str {
+    match method {
+        "GET" => {
+            "bg-sky-50 text-sky-700 ring-sky-200 dark:border dark:border-sky-600/60 dark:bg-[#062238] dark:text-[#38bdf8]"
         }
-        result.push(c);
+        "POST" => {
+            "bg-emerald-50 text-emerald-700 ring-emerald-200 dark:border dark:border-emerald-600/60 dark:bg-[#06261c] dark:text-[#34d399]"
+        }
+        "PUT" | "PATCH" => {
+            "bg-amber-50 text-amber-700 ring-amber-200 dark:border dark:border-amber-600/60 dark:bg-[#381a06] dark:text-[#fbbf24]"
+        }
+        "DELETE" => {
+            "bg-rose-50 text-rose-700 ring-rose-200 dark:border dark:border-rose-600/60 dark:bg-[#3d0818] dark:text-[#fb7185]"
+        }
+        _ => {
+            "bg-slate-50 text-slate-600 ring-slate-200 dark:border dark:border-slate-700/60 dark:bg-slate-900 dark:text-slate-400"
+        }
     }
-    result
-}
-
-fn format_ms(val: f64) -> String {
-    if val >= 1000.0 {
-        format!("{:.2} s", val / 1000.0)
-    } else {
-        format!("{:.1} ms", val)
-    }
-}
-
-fn build_api_tsv(endpoints: &[EndpointStats]) -> String {
-    let mut tsv = String::from("Method\tEndpoint\tCount\tAvg (ms)\tp95 (ms)\tp99 (ms)\tMax (ms)\tErrors\n");
-    for r in endpoints {
-        tsv.push_str(&format!(
-            "{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{}\n",
-            r.method.as_str(),
-            r.path,
-            r.total_calls,
-            r.avg_duration_ms(),
-            r.p95_ms,
-            r.p99_ms,
-            r.max_duration_ms,
-            r.failed_calls
-        ));
-    }
-    tsv
 }
 
 #[component]
-pub fn ApiTable(
-    endpoints: Signal<Vec<EndpointStats>>,
-    on_toast: EventHandler<String>,
-) -> Element {
-    let copy_tsv = move |_| {
-        let ep = endpoints();
-        if ep.is_empty() {
-            return;
-        }
-        let tsv = build_api_tsv(&ep);
-        if let Ok(mut ctx) = arboard::Clipboard::new() {
-            let _ = ctx.set_text(tsv);
-            on_toast.call("API table copied — paste into Excel".to_string());
-        } else {
-            on_toast.call("Copied to clipboard".to_string());
-        }
-    };
+pub fn ApiTable(rows: Vec<AggregatedEndpoint>) -> Element {
+    let store = use_analysis_store();
+    let filters = store.filters();
+    let height = 420.0_f64.min(120.0_f64.max(rows.len() as f64 * 32.0 + 36.0));
+    let rows_for_copy = rows.clone();
 
     rsx! {
         section { class: "overflow-hidden rounded border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900",
@@ -67,81 +44,191 @@ pub fn ApiTable(
                 }
                 button {
                     r#type: "button",
-                    onclick: copy_tsv,
-                    disabled: endpoints().is_empty(),
-                    class: "inline-flex items-center gap-1 text-[11px] font-medium text-slate-500 hover:text-slate-800 disabled:opacity-40 dark:text-slate-400 dark:hover:text-slate-200 cursor-pointer bg-transparent border-0",
-                    svg { width: "12", height: "12", class: "size-3", fill: "none", stroke: "currentColor", stroke_width: "2", view_box: "0 0 24 24",
-                        rect { x: "9", y: "9", width: "13", height: "13", rx: "2", ry: "2" }
-                        path { d: "M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" }
-                    }
+                    onclick: move |_| {
+                        if rows_for_copy.is_empty() {
+                            return;
+                        }
+                        if copy_to_clipboard(&build_api_tsv(&rows_for_copy)) {
+                            show_toast(store, "API table copied — paste into Excel");
+                        }
+                    },
+                    disabled: rows.is_empty(),
+                    class: "inline-flex items-center gap-1 text-[11px] font-medium text-slate-500 hover:text-slate-800 disabled:opacity-40 dark:text-slate-400 dark:hover:text-slate-200 cursor-pointer border-0 bg-transparent",
+                    Icon { name: "copy", class: "size-3" }
                     "Copy TSV"
                 }
             }
-
-            if endpoints().is_empty() {
+            if rows.is_empty() {
                 div { class: "px-3 py-10 text-center text-sm text-slate-400 dark:text-slate-500",
-                    "Upload or paste logs to see endpoints here."
+                    "No matching endpoints"
                 }
             } else {
-                div { class: "max-h-[420px] overflow-auto",
-                    div { class: "grid grid-cols-[minmax(0,1fr)_64px_64px_64px_64px_64px_56px] items-center gap-1 border-b border-slate-100 bg-slate-50 px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-400 sticky top-0 z-10",
-                        div { "Endpoint" }
-                        div { class: "text-right", "Count" }
-                        div { class: "text-right", "Avg" }
-                        div { class: "text-right", "p95" }
-                        div { class: "text-right", "p99" }
-                        div { class: "text-right", "Max" }
-                        div { class: "text-right", "Err" }
-                    }
-                    for (i, row) in endpoints().iter().enumerate() {
-                        {
-                            let method_str = row.method.as_str();
-                            let badge_class = match method_str {
-                                "GET" => "inline-block shrink-0 rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider ring-1 dark:ring-0 bg-sky-50 text-sky-700 ring-sky-200 dark:border dark:border-sky-600/60 dark:bg-[#062238] dark:text-[#38bdf8]",
-                                "POST" => "inline-block shrink-0 rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider ring-1 dark:ring-0 bg-emerald-50 text-emerald-700 ring-emerald-200 dark:border dark:border-emerald-600/60 dark:bg-[#06261c] dark:text-[#34d399]",
-                                "PUT" | "PATCH" => "inline-block shrink-0 rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider ring-1 dark:ring-0 bg-amber-50 text-amber-700 ring-amber-200 dark:border dark:border-amber-600/60 dark:bg-[#381a06] dark:text-[#fbbf24]",
-                                "DELETE" => "inline-block shrink-0 rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider ring-1 dark:ring-0 bg-rose-50 text-rose-700 ring-rose-200 dark:border dark:border-rose-600/60 dark:bg-[#3d0818] dark:text-[#fb7185]",
-                                _ => "inline-block shrink-0 rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider ring-1 dark:ring-0 bg-slate-50 text-slate-600 ring-slate-200 dark:border dark:border-slate-700/60 dark:bg-slate-900 dark:text-slate-400",
-                            };
-                            let is_even = i % 2 == 0;
-                            let row_class = if is_even {
-                                "grid grid-cols-[minmax(0,1fr)_64px_64px_64px_64px_64px_56px] items-center gap-1 border-b border-slate-100 px-3 py-1.5 text-xs transition-colors dark:border-slate-800/60 bg-white dark:bg-slate-900 hover:dark:bg-blue-950/30"
-                            } else {
-                                "grid grid-cols-[minmax(0,1fr)_64px_64px_64px_64px_64px_56px] items-center gap-1 border-b border-slate-100 px-3 py-1.5 text-xs transition-colors dark:border-slate-800/60 bg-slate-50/80 dark:bg-[rgb(11,18,37)] hover:dark:bg-blue-950/30"
-                            };
-                            let path = row.path.clone();
-
-                            rsx! {
-                                div { key: "{row.path}_{method_str}", class: "{row_class}",
-                                    div { class: "flex min-w-0 items-center gap-2",
-                                        span { class: "{badge_class}", "{method_str}" }
-                                        button {
-                                            r#type: "button",
-                                            title: "Copy path",
-                                            onclick: move |_| {
-                                                if let Ok(mut ctx) = arboard::Clipboard::new() {
-                                                    let _ = ctx.set_text(path.clone());
+                div { class: "overflow-x-auto",
+                    div { class: "min-w-[680px]",
+                        div { class: "grid grid-cols-[minmax(0,1fr)_56px_58px_58px_58px_58px_56px] border-b border-slate-200 bg-slate-50 px-3 py-2 text-[11px] font-semibold text-slate-500 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-400",
+                            div { "Endpoint" }
+                            ApiSortHeader {
+                                label: "Count",
+                                col_key: ApiSortKey::Count,
+                                current_key: filters.sort_key,
+                                current_dir: filters.sort_dir,
+                            }
+                            ApiSortHeader {
+                                label: "Avg",
+                                col_key: ApiSortKey::AvgMs,
+                                current_key: filters.sort_key,
+                                current_dir: filters.sort_dir,
+                            }
+                            ApiSortHeader {
+                                label: "p95",
+                                col_key: ApiSortKey::P95Ms,
+                                current_key: filters.sort_key,
+                                current_dir: filters.sort_dir,
+                            }
+                            ApiSortHeader {
+                                label: "p99",
+                                col_key: ApiSortKey::P99Ms,
+                                current_key: filters.sort_key,
+                                current_dir: filters.sort_dir,
+                            }
+                            ApiSortHeader {
+                                label: "Max",
+                                col_key: ApiSortKey::MaxMs,
+                                current_key: filters.sort_key,
+                                current_dir: filters.sort_dir,
+                            }
+                            ApiSortHeader {
+                                label: "Errors",
+                                col_key: ApiSortKey::ErrorCount,
+                                current_key: filters.sort_key,
+                                current_dir: filters.sort_dir,
+                            }
+                        }
+                        div { class: "overflow-auto", style: "height: {height}px;",
+                            div { style: "height: {rows.len() * 32}px; width: 100%;",
+                                for (index, row) in rows.iter().enumerate() {
+                                    {
+                                        let path = row.path.clone();
+                                        let method = row.method.as_str();
+                                        let is_even = index % 2 == 0;
+                                        let row_bg = if is_even { "bg-white dark:bg-slate-900" } else { "bg-slate-50/50 dark:bg-slate-950/40" };
+                                        let err_class = if row.error_count > 0 {
+                                            "text-right tabular-nums font-semibold text-rose-600 dark:text-rose-500"
+                                        } else {
+                                            "text-right tabular-nums text-slate-400 dark:text-slate-600"
+                                        };
+                                        rsx! {
+                                            div {
+                                                key: "{row.key}",
+                                                class: cn(&[
+                                                    "grid grid-cols-[minmax(0,1fr)_56px_58px_58px_58px_58px_56px] items-center border-b border-slate-100 px-3 text-xs dark:border-slate-800",
+                                                    row_bg,
+                                                ]),
+                                                style: "height: 32px;",
+                                                div { class: "flex min-w-0 items-center gap-2 pr-2",
+                                                    span {
+                                                        class: cn(&[
+                                                            "inline-block shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide ring-1 dark:ring-0",
+                                                            method_class(method),
+                                                        ]),
+                                                        "{method}"
+                                                    }
+                                                    button {
+                                                        r#type: "button",
+                                                        onclick: move |_| {
+                                                            if copy_to_clipboard(&path) {
+                                                                show_toast(store, "Path copied");
+                                                            }
+                                                        },
+                                                        title: "Click to copy: {row.path}",
+                                                        class: "group flex min-w-0 flex-1 items-center gap-1.5 text-left font-mono-data text-[11px] text-slate-800 hover:text-blue-600 dark:text-slate-200 dark:hover:text-blue-400 cursor-pointer border-0 bg-transparent",
+                                                        span { class: "truncate", "{row.path}" }
+                                                        Icon { name: "copy", class: "size-3 shrink-0 opacity-0 group-hover:opacity-100 text-slate-400 transition-opacity" }
+                                                    }
                                                 }
-                                                on_toast.call("Path copied".to_string());
-                                            },
-                                            class: "truncate text-left font-mono-data text-[11px] text-slate-800 hover:text-blue-700 dark:text-slate-200 dark:hover:text-blue-400 bg-transparent border-0 cursor-pointer p-0",
-                                            "{row.path}"
+                                                div { class: "text-right tabular-nums text-slate-700 dark:text-slate-300",
+                                                    "{format_num(row.count)}"
+                                                }
+                                                div { class: "text-right tabular-nums text-slate-700 dark:text-slate-300",
+                                                    "{format_ms(row.avg_ms)}"
+                                                }
+                                                div { class: "text-right tabular-nums font-semibold text-blue-600 dark:text-blue-400",
+                                                    "{format_ms(row.p95_ms)}"
+                                                }
+                                                div { class: "text-right tabular-nums text-slate-700 dark:text-slate-300",
+                                                    "{format_ms(row.p99_ms)}"
+                                                }
+                                                div { class: "text-right tabular-nums font-semibold text-amber-700 dark:text-amber-400",
+                                                    "{format_ms(row.max_ms)}"
+                                                }
+                                                div { class: "{err_class}",
+                                                    "{format_num(row.error_count)}"
+                                                }
+                                            }
                                         }
-                                    }
-                                    div { class: "text-right tabular-nums text-slate-700 dark:text-slate-300 font-mono-data", "{format_num(row.total_calls)}" }
-                                    div { class: "text-right tabular-nums text-slate-700 dark:text-slate-300 font-mono-data", "{format_ms(row.avg_duration_ms())}" }
-                                    div { class: "text-right font-bold tabular-nums text-blue-600 dark:text-blue-400 font-mono-data", "{format_ms(row.p95_ms as f64)}" }
-                                    div { class: "text-right tabular-nums text-slate-700 dark:text-slate-300 font-mono-data", "{format_ms(row.p99_ms as f64)}" }
-                                    div { class: "text-right font-bold tabular-nums text-amber-700 dark:text-amber-400 font-mono-data", "{format_ms(row.max_duration_ms as f64)}" }
-                                    div {
-                                        class: if row.failed_calls > 0 { "text-right tabular-nums font-bold text-rose-600 dark:text-rose-500 font-mono-data" } else { "text-right tabular-nums text-slate-400 dark:text-slate-600 font-mono-data" },
-                                        "{format_num(row.failed_calls)}"
                                     }
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn ApiSortHeader(
+    label: String,
+    col_key: ApiSortKey,
+    current_key: ApiSortKey,
+    current_dir: SortDirection,
+) -> Element {
+    let store = use_analysis_store();
+    let is_active = current_key == col_key;
+    let title = format!(
+        "Sort by {label} ({})",
+        if is_active && current_dir == SortDirection::Desc {
+            "descending"
+        } else {
+            "ascending"
+        }
+    );
+    rsx! {
+        button {
+            r#type: "button",
+            onclick: move |_| {
+                let mut f = store.filters();
+                if f.sort_key == col_key {
+                    f.sort_dir = if f.sort_dir == SortDirection::Asc {
+                        SortDirection::Desc
+                    } else {
+                        SortDirection::Asc
+                    };
+                } else {
+                    f.sort_key = col_key;
+                    f.sort_dir = SortDirection::Desc;
+                }
+                crate::store::set_filters(store, f);
+            },
+            class: cn(&[
+                "group flex w-full items-center gap-1 cursor-pointer select-none transition-colors border-0 bg-transparent justify-end text-right",
+                if is_active {
+                    "font-bold text-blue-600 dark:text-blue-400"
+                } else {
+                    "text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200"
+                },
+            ]),
+            title: "{title}",
+            span { "{label}" }
+            if is_active {
+                if current_dir == SortDirection::Asc {
+                    Icon { name: "arrow-up", class: "size-3 shrink-0" }
+                } else {
+                    Icon { name: "arrow-down", class: "size-3 shrink-0" }
+                }
+            } else {
+                Icon { name: "arrow-up-down", class: "size-2.5 shrink-0 opacity-0 group-hover:opacity-60 transition-opacity" }
             }
         }
     }

@@ -1,271 +1,324 @@
+//! Result + filter models mirroring `src/parser/types.ts` of the Wasm reference.
+
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Method {
+pub const METHODS: [LogMethod; 6] = [
+    LogMethod::Get,
+    LogMethod::Post,
+    LogMethod::Put,
+    LogMethod::Patch,
+    LogMethod::Delete,
+    LogMethod::Head,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum LogMethod {
     Get,
     Post,
     Put,
     Patch,
     Delete,
-    Options,
     Head,
 }
 
-impl Method {
-    pub fn as_str(&self) -> &'static str {
+impl LogMethod {
+    pub fn index(self) -> u8 {
         match self {
-            Method::Get => "GET",
-            Method::Post => "POST",
-            Method::Put => "PUT",
-            Method::Patch => "PATCH",
-            Method::Delete => "DELETE",
-            Method::Options => "OPTIONS",
-            Method::Head => "HEAD",
+            LogMethod::Get => 0,
+            LogMethod::Post => 1,
+            LogMethod::Put => 2,
+            LogMethod::Patch => 3,
+            LogMethod::Delete => 4,
+            LogMethod::Head => 5,
         }
     }
 
-    #[allow(dead_code)]
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        match bytes {
-            b"GET" => Some(Method::Get),
-            b"POST" => Some(Method::Post),
-            b"PUT" => Some(Method::Put),
-            b"PATCH" => Some(Method::Patch),
-            b"DELETE" => Some(Method::Delete),
-            b"OPTIONS" => Some(Method::Options),
-            b"HEAD" => Some(Method::Head),
-            _ => None,
-        }
+    pub fn from_index(i: usize) -> LogMethod {
+        METHODS.get(i).copied().unwrap_or(LogMethod::Get)
     }
 
-    pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Method::Get),
-            1 => Some(Method::Post),
-            2 => Some(Method::Put),
-            3 => Some(Method::Patch),
-            4 => Some(Method::Delete),
-            5 => Some(Method::Options),
-            6 => Some(Method::Head),
-            _ => None,
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogMethod::Get => "GET",
+            LogMethod::Post => "POST",
+            LogMethod::Put => "PUT",
+            LogMethod::Patch => "PATCH",
+            LogMethod::Delete => "DELETE",
+            LogMethod::Head => "HEAD",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PathNormMode {
-    Raw,
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum NormalizeMode {
+    #[serde(rename = "exact")]
+    Exact,
+    #[serde(rename = "stripQuery")]
     StripQuery,
+    #[serde(rename = "collapseIds")]
     CollapseIds,
 }
 
-impl Default for PathNormMode {
-    fn default() -> Self {
-        PathNormMode::CollapseIds
+impl NormalizeMode {
+    /// 0 exact / 1 stripQuery / 2 collapseIds (kernel code).
+    pub fn code(self) -> u8 {
+        match self {
+            NormalizeMode::Exact => 0,
+            NormalizeMode::StripQuery => 1,
+            NormalizeMode::CollapseIds => 2,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            NormalizeMode::Exact => "exact",
+            NormalizeMode::StripQuery => "stripQuery",
+            NormalizeMode::CollapseIds => "collapseIds",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<NormalizeMode> {
+        match key {
+            "exact" => Some(NormalizeMode::Exact),
+            "stripQuery" => Some(NormalizeMode::StripQuery),
+            "collapseIds" => Some(NormalizeMode::CollapseIds),
+            _ => None,
+        }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum StatusFamily {
+    #[serde(rename = "all")]
     All,
-    Success, // 2xx
-    Redirect, // 3xx
-    ClientError, // 4xx
-    ServerError, // 5xx
-    ErrorOnly, // 4xx + 5xx
+    #[serde(rename = "2xx")]
+    X2xx,
+    #[serde(rename = "3xx")]
+    X3xx,
+    #[serde(rename = "4xx")]
+    X4xx,
+    #[serde(rename = "5xx")]
+    X5xx,
 }
 
-impl Default for StatusFamily {
-    fn default() -> Self {
-        StatusFamily::All
+impl StatusFamily {
+    pub fn code(self) -> u8 {
+        match self {
+            StatusFamily::All => 0,
+            StatusFamily::X2xx => 2,
+            StatusFamily::X3xx => 3,
+            StatusFamily::X4xx => 4,
+            StatusFamily::X5xx => 5,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            StatusFamily::All => "all",
+            StatusFamily::X2xx => "2xx",
+            StatusFamily::X3xx => "3xx",
+            StatusFamily::X4xx => "4xx",
+            StatusFamily::X5xx => "5xx",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<StatusFamily> {
+        match key {
+            "all" => Some(StatusFamily::All),
+            "2xx" => Some(StatusFamily::X2xx),
+            "3xx" => Some(StatusFamily::X3xx),
+            "4xx" => Some(StatusFamily::X4xx),
+            "5xx" => Some(StatusFamily::X5xx),
+            _ => None,
+        }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FilterOptions {
-    pub method: Option<Method>,
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParseOptions {
+    pub normalize_mode: NormalizeMode,
+    pub method_filter: Option<Vec<String>>,
     pub status_family: StatusFamily,
-    pub min_duration_ms: f32,
-    pub max_duration_ms: Option<f32>,
-    pub search_query: String,
-    pub path_norm_mode: PathNormMode,
+    pub min_ms: f64,
+    pub cron_query: String,
+    pub cron_min_ms: f64,
+    pub cron_show_failed_only: bool,
+    pub date_filter: Option<String>,
 }
 
-impl Default for FilterOptions {
+impl Default for ParseOptions {
     fn default() -> Self {
         Self {
-            method: None,
+            normalize_mode: NormalizeMode::CollapseIds,
+            method_filter: None,
             status_family: StatusFamily::All,
-            min_duration_ms: 0.0,
-            max_duration_ms: None,
-            search_query: String::new(),
-            path_norm_mode: PathNormMode::CollapseIds,
+            min_ms: 0.0,
+            cron_query: String::new(),
+            cron_min_ms: 0.0,
+            cron_show_failed_only: false,
+            date_filter: None,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EndpointStats {
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AggregatedEndpoint {
+    pub key: String,
+    pub method: LogMethod,
     pub path: String,
-    pub method: Method,
-    pub total_calls: u64,
-    pub error_calls: u64,
-    pub failed_calls: u64,
-    pub total_duration_ms: f64,
-    pub min_duration_ms: f32,
-    pub max_duration_ms: f32,
-    pub p50_ms: f32,
-    pub p90_ms: f32,
-    pub p95_ms: f32,
-    pub p99_ms: f32,
-    pub status_counts: std::collections::HashMap<u16, u64>,
+    pub count: u64,
+    pub avg_ms: f64,
+    pub p50_ms: f64,
+    pub p90_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+    pub min_ms: f64,
+    pub error_count: u64,
 }
 
-impl EndpointStats {
-    pub fn error_rate(&self) -> f64 {
-        if self.total_calls == 0 {
-            0.0
-        } else {
-            (self.error_calls as f64 / self.total_calls as f64) * 100.0
-        }
-    }
-
-    pub fn avg_duration_ms(&self) -> f64 {
-        if self.total_calls == 0 {
-            0.0
-        } else {
-            self.total_duration_ms / self.total_calls as f64
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CronJobStats {
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CronAggregated {
     pub name: String,
-    pub total_runs: u64,
+    pub runs: u64,
     pub starts: u64,
-    pub total_success: u64,
-    pub failed_runs: u64,
-    pub total_failures: u64,
-    pub total_duration_ms: f64,
-    pub avg_duration_ms: f64,
-    pub min_duration_ms: f32,
-    pub max_duration_ms: f32,
-    pub p95_ms: f32,
-    pub p99_ms: f32,
-    pub last_duration_ms: f32,
-    pub last_status: String,
+    pub fails: u64,
+    pub avg_ms: f64,
+    pub p50_ms: f64,
+    pub p90_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+    pub min_ms: f64,
+    pub last_run_ts: Option<String>,
+    pub last_duration_ms: Option<f64>,
 }
 
-pub type CronStats = CronJobStats;
+#[derive(Clone, Default, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogSummary {
+    pub matched: u64,
+    pub unmatched: u64,
+    pub max: f64,
+    pub avg: f64,
+    pub p95_ms: f64,
+    pub errors: u64,
+    pub slow: u64,
+}
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CronSummary {
+    pub starts: u64,
+    pub dones: u64,
+    pub fails: u64,
+    pub jobs: u64,
+    pub slowest_run: f64,
+}
+
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HourlyBucket {
     pub hour: u8,
     pub label: String,
     pub count: u64,
     pub error_count: u64,
-    pub avg_ms: f32,
-    pub p95_ms: f32,
-    pub p99_ms: f32,
+    pub avg_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LogAnalysisSummary {
-    pub total_file_size_bytes: u64,
-    pub total_lines_parsed: u64,
-    pub matched_http_requests: u64,
-    pub unmatched_lines: u64,
-    pub total_cron_events: u64,
-    pub parse_duration_ms: u64,
-    pub overall_p50_ms: f32,
-    pub overall_p90_ms: f32,
-    pub overall_p95_ms: f32,
-    pub overall_p99_ms: f32,
-    pub overall_error_count: u64,
-    pub overall_error_rate: f64,
-    pub endpoints: Vec<EndpointStats>,
-    pub cron_jobs: Vec<CronStats>,
-    pub hourly_buckets: Vec<HourlyBucket>,
-    pub unmatched_samples: Vec<String>,
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaySummary {
+    pub date: String,
+    pub count: u64,
+    pub error_count: u64,
+    pub avg_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+    pub slow_count: u64,
+    pub hourly_stats: Vec<HourlyBucket>,
 }
 
-impl LogAnalysisSummary {
-    pub fn avg_latency_ms(&self) -> f32 {
-        let total_calls: u64 = self.endpoints.iter().map(|e| e.total_calls).sum();
-        let total_dur: f64 = self.endpoints.iter().map(|e| e.total_duration_ms).sum();
-        if total_calls > 0 {
-            (total_dur / total_calls as f64) as f32
-        } else {
-            0.0
-        }
-    }
-
-    pub fn p95_latency_ms(&self) -> f32 {
-        self.overall_p95_ms
-    }
-
-    pub fn error_responses(&self) -> u64 {
-        self.overall_error_count
-    }
-
-    pub fn slow_requests_3s(&self) -> u64 {
-        self.endpoints.iter().map(|e| if e.max_duration_ms >= 3000.0 { e.total_calls } else { 0 }).sum()
-    }
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AggregatedResult {
+    pub api: Vec<AggregatedEndpoint>,
+    pub cron: Vec<CronAggregated>,
+    pub summary: LogSummary,
+    pub cron_summary: CronSummary,
+    pub hourly_stats: Vec<HourlyBucket>,
+    pub methods: Vec<String>,
+    pub unmatched_sample: Vec<String>,
+    pub unmatched_count: u64,
+    pub dates: Vec<String>,
+    pub daily_stats: Vec<DaySummary>,
 }
 
-impl Default for LogAnalysisSummary {
+impl Default for AggregatedResult {
     fn default() -> Self {
         Self {
-            total_file_size_bytes: 0,
-            total_lines_parsed: 0,
-            matched_http_requests: 0,
-            unmatched_lines: 0,
-            total_cron_events: 0,
-            parse_duration_ms: 0,
-            overall_p50_ms: 0.0,
-            overall_p90_ms: 0.0,
-            overall_p95_ms: 0.0,
-            overall_p99_ms: 0.0,
-            overall_error_count: 0,
-            overall_error_rate: 0.0,
-            endpoints: Vec::new(),
-            cron_jobs: Vec::new(),
-            hourly_buckets: Vec::new(),
-            unmatched_samples: Vec::new(),
+            api: Vec::new(),
+            cron: Vec::new(),
+            summary: LogSummary::default(),
+            cron_summary: CronSummary::default(),
+            hourly_stats: Vec::new(),
+            methods: Vec::new(),
+            unmatched_sample: Vec::new(),
+            unmatched_count: 0,
+            dates: Vec::new(),
+            daily_stats: Vec::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortColumn {
-    Path,
-    Method,
-    Calls,
-    ErrorRate,
-    AvgDuration,
-    P50,
-    P95,
-    P99,
+pub const EMPTY_RESULT: AggregatedResult = AggregatedResult {
+    api: Vec::new(),
+    cron: Vec::new(),
+    summary: LogSummary {
+        matched: 0,
+        unmatched: 0,
+        max: 0.0,
+        avg: 0.0,
+        p95_ms: 0.0,
+        errors: 0,
+        slow: 0,
+    },
+    cron_summary: CronSummary {
+        starts: 0,
+        dones: 0,
+        fails: 0,
+        jobs: 0,
+        slowest_run: 0.0,
+    },
+    hourly_stats: Vec::new(),
+    methods: Vec::new(),
+    unmatched_sample: Vec::new(),
+    unmatched_count: 0,
+    dates: Vec::new(),
+    daily_stats: Vec::new(),
+};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CronEventKind {
+    Start,
+    Done,
+    Fail,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortDirection {
-    Ascending,
-    Descending,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TableSortState {
-    pub column: SortColumn,
-    pub direction: SortDirection,
-}
-
-impl Default for TableSortState {
-    fn default() -> Self {
-        Self {
-            column: SortColumn::P95,
-            direction: SortDirection::Descending,
-        }
-    }
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CronEventCompact {
+    pub ts: Option<String>,
+    pub event: CronEventKind,
+    pub name: String,
+    pub duration_ms: Option<f64>,
 }

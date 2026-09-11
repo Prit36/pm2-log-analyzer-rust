@@ -3,8 +3,10 @@ pub mod charts;
 pub mod cron_table;
 pub mod filters;
 pub mod header;
+pub mod icons;
 pub mod ingest;
 pub mod kpi;
+pub mod mongo;
 pub mod skipped;
 pub mod toast;
 

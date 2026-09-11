@@ -1,0 +1,18 @@
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+await page.goto("http://localhost:5173", { waitUntil: "networkidle" });
+await page.evaluate(() => localStorage.clear());
+await page.reload({ waitUntil: "networkidle" });
+await page.waitForTimeout(1200);
+await page.screenshot({ path: "../parity/out/react_empty.png" });
+const cdp = await chromium.connectOverCDP("http://localhost:9222");
+const ctx = cdp.contexts()[0];
+const rust = ctx.pages()[0] || (await ctx.newPage());
+await rust.setViewportSize({ width: 1440, height: 900 });
+await rust.waitForTimeout(1200);
+const href = await rust.evaluate(() => location.href);
+console.log("rust href:", href);
+await rust.screenshot({ path: "../parity/out/rust_empty.png" });
+await browser.close();
+await cdp.close();

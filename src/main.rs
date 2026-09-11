@@ -11,7 +11,11 @@ fn main() {
         .with_min_inner_size(LogicalSize::new(900.0, 600.0))
         .with_resizable(true);
 
-    let config = Config::new().with_window(window);
+    let mut config = Config::new().with_window(window);
+    // Test harness hook: isolated WebView2 storage per run (fresh localStorage).
+    if let Ok(dir) = std::env::var("PM2_ANALYZER_DATA_DIR") {
+        config = config.with_data_directory(std::path::PathBuf::from(dir));
+    }
 
     LaunchBuilder::new()
         .with_cfg(config)

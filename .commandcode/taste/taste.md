@@ -1,1 +1,4 @@
 - Prefers discarding unwanted unpushed commits entirely via `git reset --hard origin/master` to leave branch matching origin with nothing to push and a clean working tree, rather than soft reset keeping changes or adding revert commits. Confidence: 0.8
+- Wants pass/fail thresholds (e.g., a 99.5% visual parity minimum) enforced as hard gates in test runners — the run should exit non-zero and fail CI when below the threshold, not just be reported as a pass/fail tag. Confidence: 0.6
+- Prefers implementation to begin immediately without entering a separate planning mode. Confidence: 0.95
+- When work remains incomplete, prefers the assistant to continue debugging and validating from the current state rather than stop after reporting partial results. Confidence: 0.85
