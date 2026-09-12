@@ -8,12 +8,22 @@ are pure Rust and are vendored verbatim (only `lib.rs` wasm-bindgen wrappers are
 
 ## Stage 1 — PM2 kernel parity (data) — DONE
 - Vendored `wasm/pm2-core/src/{normalize,parse,relhist,store}.rs` → `src/kernels/pm2/`
-  (verbatim; `Engine::feed_bytes` added as the native ingest entry point).
+  (wasm-bindgen wrappers stripped). Native-only additions to the vendored kernel:
+  `Engine::feed_slice` (zero-copy ingest), `Engine::reaggregate_partial` /
+  `encode_partial` (structured partials plus the wire encoder for parity dumps),
+  structured `hourly_accs()` / `daily_accs()` accessors, 128-bit path fingerprints in
+  `intern_path`, and `RelHist::{merge, quantile, quantiles4}`. The wire bytes produced by
+  `reaggregate` are byte-identical to the original kernel (verified shard-by-shard).
 - Native driver `src/core/pm2.rs` mirrors `logParserWorker.ts` + `shardParserWorker.ts`:
-  pool size `max(2,min(4,hc))`, shard split at `>= 8 MiB`, 16 MiB feed chunks, read window
-  `[start-1, end+256KiB)`, meta absorb (cron/unmatched/hourly/dates/daily), summary cache,
-  `cronSummary`, date-filtered hourly, unmatched sample cap 40, multi-file composite source.
-- `src/core/relhist_js.rs` reproduces `relHist.ts` merge/quantile semantics for the coordinator.
+  shard split at `>= 8 MiB`, 16 MiB feed chunks, read window `[start-1, end+256KiB)`,
+  meta absorb (cron/unmatched/hourly/dates/daily), summary cache, `cronSummary`,
+  date-filtered hourly, unmatched sample cap 40, multi-file composite source. The reference
+  browser is capped at 4 workers for Wasm memory reasons; the native pool defaults to one
+  shard per logical core (`max(2,min(16,hc))`, `PM2_ANALYZER_SHARDS` override) and feeds
+  each 16 MiB chunk from a per-segment mmap so page-table teardown happens in parallel.
+- Coordinator merges the structured shard partials directly (kernel `RelHist`, no
+  wire encode/decode); `src/core/relhist_js.rs` is retained as the JS-parity reference and
+  is covered by a unit test that asserts identical quantiles.
 - Result model mirrors `src/parser/types.ts` field-for-field (`src/core/models.rs`).
 
 Verification (run from this repo):
@@ -25,8 +35,9 @@ cd ../pm2-log-analyzer && npx tsx ../pm2-log-analyzer-rust/parity/coordinator.mt
   ../pm2-log-analyzer-rust/target/parity/wires56 > ../pm2-log-analyzer-rust/target/parity/ref56.json
 cd ../pm2-log-analyzer-rust && node parity/compare.mjs target/parity/native56.json target/parity/ref56.json
 ```
-Result: native result deep-equals the reference coordinator result on a 56 MB / 4-shard
-corpus and on `smoke.log`.
+Result: native result deep-equals the reference coordinator result on a 56 MB corpus and on
+`smoke.log`; with `PM2_ANALYZER_SHARDS=4` every dumped shard wire (partial, cron, hourly,
+daily, dates, unmatched) is byte-identical to the pre-optimization kernel.
 
 ## Stage 2 — PM2 UI shell parity — DONE (chart pixel-verification ongoing)
 - `src/app.rs`: Elm shell (`App`/`Message`/`update`/`view`/`subscription`), window-resize and

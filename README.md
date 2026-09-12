@@ -6,13 +6,13 @@
 [![Target OS](https://img.shields.io/badge/platform-Windows%20x64-0078D6.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A high-throughput, native Windows desktop application for analyzing large-scale PM2 process log files. Built in Rust 2024 using `iced` and parallel memory-mapped I/O, it parses multi-gigabyte log files at **1.76 GB/s** throughput and renders interactive latency analytics dashboards in **< 3.5 seconds for a 5.22 GB log file (65 Million lines)**.
+A high-throughput, native Windows desktop application for analyzing large-scale PM2 process log files. Built in Rust 2024 using `iced` and parallel memory-mapped I/O, it parses multi-gigabyte log files at **~3.3 GB/s** throughput and reaches an interactive latency dashboard in **~1.7 seconds for a 5.22 GB log file (65 Million lines)** — about **3.5x faster than the Wasm/React reference** on the same machine, at ~0.8 GB RSS.
 
 ---
 
 ## Key Features
 
-- **High-Throughput Parallel Engine**: Memory-mapped I/O (`memmap2`) combined with multi-threaded chunk parsing (`rayon`) and lock-free thread allocation (`mimalloc`) yielding up to **1,767 MB/s throughput**.
+- **High-Throughput Parallel Engine**: Memory-mapped I/O (`memmap2`) with per-shard segment mapping, zero-copy `feed_slice` ingest, one shard per logical core (`rayon`) and lock-free thread allocation (`mimalloc`) yielding up to **3,287 MB/s throughput**.
 - **Compact Columnar Storage**: Zero per-line heap allocations (`PackedEntry` 16-byte representation with path string interning).
 - **Logarithmic Histogram Sketches**: Relative-error histogram sketches (`RelHist`, $\gamma \approx 1.0202$) for bounded $O(1)$ memory quantile estimation (p50, p90, p95, p99) without storing raw duration arrays.
 - **Strict Format Parity**: Full support for PM2 Format A (`[TIMESTAMP] METHOD PATH STATUS DURATION ms - BYTES`), Format B (`DURATION ms METHOD PATH`), Cron events (`[cron]`), ISO timestamps, and inline ANSI escape sequences.
@@ -26,32 +26,34 @@ All benchmarks were conducted on **Windows 11 x64 (12-Thread CPU)** using the re
 
 ### 1. Large Dataset: 5.22 GB Log File (`api-out-5gb.log` / 65,083,800 Lines)
 
-| Benchmark Metric | WASM Engine (Browser + Workers) | Native Rust Engine (Phase 1) | Native Rust Engine (Final Release) | Delta vs. WASM |
-| :--- | :--- | :--- | :--- | :--- |
-| **Parse Wall Time** | 7.85 s – 8.07 s | 3.48 s | **3.03 s** | **2.60x Faster** |
-| **Parse Throughput** | ~670 MB/s | 1,540 MB/s | **1,767 MB/s** | **+163% Throughput** |
-| **Parse Finish $\to$ UI Render** | ~900 ms | 578 ms | **396 ms** | **2.27x Faster** |
-| **End-to-End Time to Interactive UI** | ~8.95 s | 3.84 s | **3.42 s** | **2.61x Faster** |
-| **Total Lines Parsed** | 65,083,800 | 65,083,800 | **65,083,800** | **100% Parity** |
-| **Matched HTTP Requests** | 37,184,500 | 37,184,500 | **37,184,500** | **100% Parity** |
-| **Unmatched Log Lines** | 27,885,900 | 27,885,900 | **27,885,900** | **100% Parity** |
-| **Unique Endpoints (`:id`)** | 6,107 | 6,107 | **6,107** | **100% Parity** |
-| **Overall p95 Latency** | 1,159.1 ms | 1,153.1 ms | **1,153.1 ms** | **100% Parity** |
-| **Search Filter Query ("auth")** | ~400 ms | 3,025 ms | **19 ms** | **Sub-20 ms** |
-| **Status Filter Query (4xx)** | ~300 ms | 332 ms | **21 ms** | **Sub-25 ms** |
-| **Table Column Sort Overhead** | UI Re-render | 0.14 ms – 1.14 ms | **0.20 ms – 1.12 ms** | **Sub-millisecond** |
+Same corpus and same aggregated numbers as the browser reference (20,315,200 matched /
+33,123,400 unmatched / 5,416 endpoints / p95 2416.9 ms). The reference column is the
+latest `bench:mongo`-family browser run recorded in `../pm2-log-analyzer/scripts/bench/history.json`
+(`native-compare`, 2026-09-11); the native column is `target/release/bench.exe` on the same
+machine (12-thread CPU, warm page cache, 12 shards).
 
----
+| Metric | Wasm engine (browser + 4 workers) | Native Rust engine | Delta |
+| :--- | :--- | :--- | :--- |
+| **Parse wall time** | 5.82 s | **1.63 s** (1.63–1.72 s over 5 runs) | **3.6x faster** |
+| **Throughput** | 919 MB/s | **3,287 MB/s** | **3.6x** |
+| **Peak RSS** | 2,871 MB | **~805 MB** | **3.6x less** |
+| **First re-aggregation** | 110.7 ms | **47 ms** | 2.4x |
+| **Matched / unmatched / endpoints / p95** | 20,315,200 / 33,123,400 / 5,416 / 2416.9 ms | identical | **100% parity** |
 
-### 2. Medium Dataset: 500 MB Log File (`api-out-500mb.log` / 6,508,380 Lines)
+### 2. Medium / small datasets
 
-| Benchmark Metric | Native Rust Engine (Final Release) | Details |
-| :--- | :--- | :--- |
-| **Parse Wall Time** | **0.620 s (619 ms)** | 863.45 MB/s throughput |
-| **Time from Parse Finish $\to$ UI Render** | **64 ms** | Pre-computed path normalization |
-| **Total End-to-End Load Time** | **0.684 s (684 ms)** | Complete dashboard initialization |
-| **Search Filter Query ("auth")** | **4 ms** | Real-time sub-frame filtering |
-| **Status Filter Query (4xx)** | **5 ms** | Real-time error rate filtering |
+| File | Lines | Parse wall | Throughput |
+| :--- | ---: | ---: | ---: |
+| `api-out-500mb.log` | 6,508,380 | **214 ms** | **2,503 MB/s** |
+| `api-out.log` | 650,838 | **26 ms** | **2,032 MB/s** |
+
+Re-aggregation (client-side filter/sort changes) stays in the tens of milliseconds:
+34 ms for the default collapse-ids view, 6–11 ms for status/min-ms/date filters, and ~1.2 s
+for the raw-path (exact) view over 270k unique endpoints.
+
+Benchmarks are reported by `cargo run --release --bin bench -- <file>`: parse wall covers
+opening, full parse, summary/hourly/daily stats, and the pre-aggregation pass; no work is
+excluded or deferred.
 
 ---
 

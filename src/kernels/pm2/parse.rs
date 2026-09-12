@@ -528,20 +528,41 @@ fn try_cron(buf: &[u8], start: usize, end: usize) -> Option<LineKind> {
     if let Some((ni, _, _, _, _)) = ts {
         i = ni;
     }
-    let cron_idx = find_cron_mark(buf, i, end)?;
-    let mut k = i;
-    while k < cron_idx {
-        k = skip_ansi(buf, k, end);
-        if k >= cron_idx {
-            break;
-        }
-        let c = buf[k];
-        if c == b' ' || c == b'\t' {
-            k += 1;
+    // The marker can only sit at the first byte that is neither space nor an ANSI
+    // escape, so a 6-byte compare replaces a full-line memmem scan for the common
+    // case (every unmatched JSON/timestamped line). ANSI sequences that would
+    // swallow the marker fall back to the exhaustive search below.
+    let mut probe = i;
+    loop {
+        probe = skip_ansi(buf, probe, end);
+        if probe < end && (buf[probe] == b' ' || buf[probe] == b'\t') {
+            probe += 1;
             continue;
         }
-        return None;
+        break;
     }
+    let cron_idx = if probe + CRON_MARK.len() <= end && &buf[probe..probe + CRON_MARK.len()] == CRON_MARK
+    {
+        probe
+    } else if probe < end && buf[probe] == 0x1b {
+        let found = find_cron_mark(buf, i, end)?;
+        let mut k = i;
+        while k < found {
+            k = skip_ansi(buf, k, end);
+            if k >= found {
+                break;
+            }
+            let c = buf[k];
+            if c == b' ' || c == b'\t' {
+                k += 1;
+                continue;
+            }
+            return None;
+        }
+        found
+    } else {
+        return None;
+    };
     i = skip_space_ansi(buf, cron_idx + 6, end);
     let event = if i + 5 <= end && &buf[i..i + 5] == b"start" && (i + 5 >= end || buf[i + 5] == b' ')
     {

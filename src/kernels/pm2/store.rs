@@ -5,15 +5,25 @@ use crate::kernels::pm2::parse::{parse_line_bytes, LineKind, Method};
 use crate::kernels::pm2::relhist::RelHist;
 use hashbrown::{HashMap, HashTable};
 use memchr::memchr;
+use rapidhash::v3::{rapidhash_v3_seeded, RapidSecrets};
 
 const LINE_EXTEND: usize = 256 * 1024;
 const INVALID_RELHIST_KEY: i16 = i16::MIN;
 /// Reusable ingest window. Keeps Wasm peak memory bounded.
 pub const INGEST_CAP: usize = 32 * 1024 * 1024;
 
+/// Secondary seed for the 128-bit path fingerprint (h1 = rapidhash, h2 = rapidhash_seeded).
+const HASH2_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+static HASH2_SECRETS: RapidSecrets = RapidSecrets::seed_cpp(HASH2_SEED);
+
 #[inline(always)]
 fn hash_bytes(b: &[u8]) -> u64 {
     rapidhash::v3::rapidhash_v3(b)
+}
+
+#[inline(always)]
+fn hash2_bytes(b: &[u8]) -> u64 {
+    rapidhash_v3_seeded(b, &HASH2_SECRETS)
 }
 
 #[repr(C)]
@@ -67,34 +77,54 @@ struct CronEv {
     duration_ms: Option<f32>,
 }
 
-struct EndpointAcc {
-    method: u8,
-    sketch: RelHist,
-    count: u32,
-    sum: f64,
-    min: f32,
-    max: f32,
-    error_count: u32,
+pub struct EndpointAcc {
+    pub method: u8,
+    pub sketch: RelHist,
+    pub count: u32,
+    pub sum: f64,
+    pub min: f32,
+    pub max: f32,
+    pub error_count: u32,
+}
+
+/// Filter-independent summary exposed to the native coordinator.
+pub struct SummaryAcc {
+    pub sum: f64,
+    pub max: f32,
+    pub errors: u32,
+    pub slow: u32,
+    pub sketch: RelHist,
+}
+
+/// Reaggregation result in structured form: the native driver merges these
+/// directly instead of encoding/decoding the wire. `norm_id` indexes the shard's
+/// normalization arena for `mode` (read back via [`Engine::norm_path`]).
+pub struct EnginePartial {
+    pub mode: u8,
+    pub matched: u32,
+    pub unmatched: u32,
+    pub endpoints: Vec<(u32, EndpointAcc)>,
+    pub summary: Option<SummaryAcc>,
 }
 
 #[derive(Clone)]
-struct HourlyAcc {
-    count: u32,
-    error_count: u32,
-    sum: f64,
-    max: f32,
-    sketch: RelHist,
+pub struct HourlyAcc {
+    pub count: u32,
+    pub error_count: u32,
+    pub sum: f64,
+    pub max: f32,
+    pub sketch: RelHist,
 }
 
-struct DailyAcc {
-    date: [u8; 10],
-    count: u32,
-    error_count: u32,
-    slow_count: u32,
-    sum: f64,
-    max: f32,
-    sketch: RelHist,
-    hourly: [HourlyAcc; 24],
+pub struct DailyAcc {
+    pub date: [u8; 10],
+    pub count: u32,
+    pub error_count: u32,
+    pub slow_count: u32,
+    pub sum: f64,
+    pub max: f32,
+    pub sketch: RelHist,
+    pub hourly: [HourlyAcc; 24],
 }
 
 pub struct Engine {
@@ -106,6 +136,12 @@ pub struct Engine {
     path_bytes: Vec<u8>,
     path_off: Vec<u32>,
     path_len: Vec<u16>,
+    /// 128-bit fingerprint per path: h1 is the table key (also kept so the hash
+    /// table can rehash on growth), h2 verifies the hit without touching the cold
+    /// path arena (~2^-128 false-match probability, matching the previous native
+    /// implementation).
+    path_hash1: Vec<u64>,
+    path_hash2: Vec<u64>,
     path_table: HashTable<u32>,
 
     entries: Vec<PackedEntry>,
@@ -136,8 +172,8 @@ pub struct Engine {
     summary_sketch: RelHist,
     summary_ready: bool,
 
-    cached_hourly_wire: Vec<u8>,
-    cached_daily_wire: Vec<u8>,
+    hourly_accs: [HourlyAcc; 24],
+    daily_accs: Vec<DailyAcc>,
 
     shard_start: u64,
     shard_end: u64,
@@ -157,6 +193,8 @@ impl Engine {
             path_bytes: Vec::new(),
             path_off: Vec::new(),
             path_len: Vec::new(),
+            path_hash1: Vec::new(),
+            path_hash2: Vec::new(),
             path_table: HashTable::new(),
             entries: Vec::new(),
             hist_keys: Vec::new(),
@@ -179,8 +217,14 @@ impl Engine {
             summary_slow: 0,
             summary_sketch: RelHist::new(),
             summary_ready: false,
-            cached_hourly_wire: Vec::new(),
-            cached_daily_wire: Vec::new(),
+            hourly_accs: std::array::from_fn(|_| HourlyAcc {
+                count: 0,
+                error_count: 0,
+                sum: 0.0,
+                max: 0.0,
+                sketch: RelHist::new(),
+            }),
+            daily_accs: Vec::new(),
             shard_start: 0,
             shard_end: 0,
             file_size: 0,
@@ -254,6 +298,8 @@ impl Engine {
         self.path_bytes.clear();
         self.path_off.clear();
         self.path_len.clear();
+        self.path_hash1.clear();
+        self.path_hash2.clear();
         self.path_table.clear();
         self.path_cache = [(0, u32::MAX); 1024];
         self.entries.clear();
@@ -279,8 +325,14 @@ impl Engine {
         self.summary_slow = 0;
         self.summary_sketch = RelHist::new();
         self.summary_ready = false;
-        self.cached_hourly_wire.clear();
-        self.cached_daily_wire.clear();
+        self.hourly_accs = std::array::from_fn(|_| HourlyAcc {
+            count: 0,
+            error_count: 0,
+            sum: 0.0,
+            max: 0.0,
+            sketch: RelHist::new(),
+        });
+        self.daily_accs.clear();
         self.last_path_id = None;
     }
 
@@ -294,27 +346,36 @@ impl Engine {
         self.feed(len as u32, abs_off)
     }
 
+    /// Zero-copy feed: process `bytes` (whose first byte sits at absolute `abs_off`)
+    /// directly from the caller's buffer. Semantics match `feed`.
+    pub fn feed_slice(&mut self, bytes: &[u8], abs_off: u64) -> u32 {
+        self.feed_view(bytes, abs_off)
+    }
+
     /// Feed `len` bytes already written at ingest[0..len] starting at absolute `abs_off`.
     pub fn feed(&mut self, len: u32, abs_off: u64) -> u32 {
         let len = (len as usize).min(self.ingest.len());
+        let ingest = std::mem::take(&mut self.ingest);
+        let fed = self.feed_view(&ingest[..len], abs_off);
+        self.ingest = ingest;
+        fed
+    }
+
+    fn feed_view(&mut self, view: &[u8], abs_off: u64) -> u32 {
         if self.carry.is_empty() {
-            self.feed_ingest_only(len, abs_off)
+            self.feed_view_only(view, abs_off)
         } else {
-            self.feed_with_carry(len, abs_off)
+            self.feed_view_with_carry(view, abs_off)
         }
     }
 
-    /// Common path: no carry — SIMD memchr newline scan over ingest window.
-    fn feed_ingest_only(&mut self, len: usize, abs_off: u64) -> u32 {
+    /// Common path: no carry — SIMD memchr newline scan over the view.
+    fn feed_view_only(&mut self, view: &[u8], abs_off: u64) -> u32 {
         let before = self.entries.len();
-        let mut ingest = std::mem::take(&mut self.ingest);
-        if ingest.len() < len {
-            ingest.resize(len, 0);
-        }
+        let len = view.len();
         let chunk_end = abs_off + len as u64;
         let at_file_end = chunk_end >= self.file_size;
         let extend_limit = self.shard_end + LINE_EXTEND as u64;
-        let view = &ingest[..len];
 
         let mut i = 0usize;
         if self.skip_partial {
@@ -328,7 +389,6 @@ impl Engine {
                         self.carry.extend_from_slice(view);
                         self.carry_abs = abs_off;
                     }
-                    self.ingest = ingest;
                     return 0;
                 }
             }
@@ -357,67 +417,19 @@ impl Engine {
             }
         }
 
-        self.ingest = ingest;
         (self.entries.len() - before) as u32
     }
 
-    /// Rare path: leftover partial line from previous chunk.
-    fn feed_with_carry(&mut self, len: usize, abs_off: u64) -> u32 {
+    /// Rare path: leftover partial line from the previous chunk.
+    fn feed_view_with_carry(&mut self, view: &[u8], abs_off: u64) -> u32 {
         let before = self.entries.len();
-
-        let mut ingest = std::mem::take(&mut self.ingest);
-        if ingest.len() < len {
-            ingest.resize(len, 0);
-        }
+        let len = view.len();
         let mut carry = std::mem::take(&mut self.carry);
         let carry_abs = self.carry_abs;
 
         let chunk_end = abs_off + len as u64;
         let at_file_end = chunk_end >= self.file_size;
         let extend_limit = self.shard_end + LINE_EXTEND as u64;
-        let ingest_view = &ingest[..len];
-
-        // Fast path: carry is empty (99.9% of chunks after first line)
-        if carry.is_empty() {
-            let buf_abs = abs_off;
-            let mut i = 0usize;
-            if self.skip_partial {
-                if let Some(nl) = memchr(b'\n', ingest_view) {
-                    i = nl + 1;
-                    self.skip_partial = false;
-                } else {
-                    if !at_file_end {
-                        self.carry.extend_from_slice(ingest_view);
-                        self.carry_abs = carry_abs;
-                    }
-                    self.ingest = ingest;
-                    return 0;
-                }
-            }
-
-            while i < len {
-                let line_start = i;
-                let abs_line_start = buf_abs + line_start as u64;
-                if abs_line_start >= self.shard_end {
-                    break;
-                }
-                if let Some(rel) = memchr(b'\n', &ingest_view[i..]) {
-                    let line_end = i + rel;
-                    self.accept_line(ingest_view, line_start, line_end);
-                    i = line_end + 1;
-                } else {
-                    if !at_file_end && abs_line_start < extend_limit {
-                        self.carry.clear();
-                        self.carry_abs = abs_line_start;
-                        self.carry.extend_from_slice(&ingest_view[line_start..]);
-                    }
-                    break;
-                }
-            }
-
-            self.ingest = ingest;
-            return (self.entries.len() - before) as u32;
-        }
 
         let total = carry.len() + len;
         let buf_abs = carry_abs;
@@ -425,7 +437,7 @@ impl Engine {
             if idx < carry.len() {
                 carry[idx]
             } else {
-                ingest_view[idx - carry.len()]
+                view[idx - carry.len()]
             }
         };
 
@@ -436,11 +448,10 @@ impl Engine {
             }
             if i >= total {
                 if !at_file_end {
-                    carry.extend_from_slice(ingest_view);
+                    carry.extend_from_slice(view);
                     self.carry = carry;
                     self.carry_abs = carry_abs;
                 }
-                self.ingest = ingest;
                 return 0;
             }
             i += 1;
@@ -468,10 +479,10 @@ impl Engine {
                     self.carry_abs = abs_line_start;
                     if line_start < carry.len() {
                         self.carry.extend_from_slice(&carry[line_start..]);
-                        self.carry.extend_from_slice(ingest_view);
+                        self.carry.extend_from_slice(view);
                     } else {
                         let s = line_start - carry.len();
-                        self.carry.extend_from_slice(&ingest_view[s..]);
+                        self.carry.extend_from_slice(&view[s..]);
                     }
                 }
                 break;
@@ -482,11 +493,11 @@ impl Engine {
             } else if line_start >= carry.len() {
                 let s = line_start - carry.len();
                 let e = line_end - carry.len();
-                self.accept_line(ingest_view, s, e);
+                self.accept_line(view, s, e);
             } else {
                 let mut line = Vec::with_capacity(line_end - line_start);
                 line.extend_from_slice(&carry[line_start..]);
-                line.extend_from_slice(&ingest_view[..line_end - carry.len()]);
+                line.extend_from_slice(&view[..line_end - carry.len()]);
                 self.accept_line(&line, 0, line.len());
             }
 
@@ -495,7 +506,6 @@ impl Engine {
             }
         }
 
-        self.ingest = ingest;
         (self.entries.len() - before) as u32
     }
 
@@ -643,13 +653,23 @@ impl Engine {
         self.summary_sketch = sum_sketch;
         self.summary_ready = true;
 
-        self.cached_hourly_wire = encode_hourly_vec(&hourly_buckets);
-        self.cached_daily_wire = encode_daily_vec(&daily_accs);
+        self.hourly_accs = hourly_buckets;
+        self.daily_accs = daily_accs;
+    }
+
+    /// Filter-independent hour-of-day request statistics.
+    pub fn hourly_accs(&self) -> &[HourlyAcc; 24] {
+        &self.hourly_accs
+    }
+
+    /// Per-date summary accumulators (in first-seen order).
+    pub fn daily_accs(&self) -> &[DailyAcc] {
+        &self.daily_accs
     }
 
     /// Encode filter-independent hour-of-day request statistics.
     pub fn hourly_wire(&self) -> Vec<u8> {
-        self.cached_hourly_wire.clone()
+        encode_hourly_vec(&self.hourly_accs)
     }
 
     /// Encode list of unique dates seen in logs.
@@ -664,7 +684,7 @@ impl Engine {
 
     /// Encode daily summary stats and per-date hourly breakdown.
     pub fn daily_wire(&self) -> Vec<u8> {
-        self.cached_daily_wire.clone()
+        encode_daily_vec(&self.daily_accs)
     }
 
     /// Summary wire for coordinator cache (same fields as PM2P summary block).
@@ -791,30 +811,25 @@ impl Engine {
                 }
             }
         }
-        let hash = hash_bytes(path);
-        let slot = (hash as usize) & 1023;
+        let h1 = hash_bytes(path);
+        let h2 = hash2_bytes(path);
+        let slot = (h1 as usize) & 1023;
         let (cached_hash, cached_id) = self.path_cache[slot];
-        if cached_hash == hash && cached_id != u32::MAX {
+        if cached_hash == h1 && cached_id != u32::MAX {
             let id_usize = cached_id as usize;
-            if id_usize < self.path_off.len() {
-                let off = self.path_off[id_usize] as usize;
-                let len = self.path_len[id_usize] as usize;
-                if path.len() == len && &self.path_bytes[off..off + len] == path {
-                    self.last_path_id = Some(cached_id);
-                    return cached_id;
-                }
+            if id_usize < self.path_hash2.len() && self.path_hash2[id_usize] == h2 {
+                self.last_path_id = Some(cached_id);
+                return cached_id;
             }
         }
 
-        let path_bytes = &self.path_bytes;
-        let path_off = &self.path_off;
-        let path_len = &self.path_len;
-        if let Some(&id) = self.path_table.find(hash, |&id| {
-            let off = path_off[id as usize] as usize;
-            let len = path_len[id as usize] as usize;
-            &path_bytes[off..off + len] == path
-        }) {
-            self.path_cache[slot] = (hash, id);
+        let path_hash1 = &self.path_hash1;
+        let path_hash2 = &self.path_hash2;
+        if let Some(&id) = self
+            .path_table
+            .find(h1, |&id| path_hash1[id as usize] == h1 && path_hash2[id as usize] == h2)
+        {
+            self.path_cache[slot] = (h1, id);
             self.last_path_id = Some(id);
             return id;
         }
@@ -824,17 +839,14 @@ impl Engine {
         self.path_bytes.extend_from_slice(path);
         self.path_off.push(off);
         self.path_len.push(path.len() as u16);
+        self.path_hash1.push(h1);
+        self.path_hash2.push(h2);
         self.mode_ready = [false; 3];
 
-        let path_bytes = &self.path_bytes;
-        let path_off = &self.path_off;
-        let path_len = &self.path_len;
-        self.path_table.insert_unique(hash, next_id, |&id| {
-            let off = path_off[id as usize] as usize;
-            let len = path_len[id as usize] as usize;
-            hash_bytes(&path_bytes[off..off + len])
-        });
-        self.path_cache[slot] = (hash, next_id);
+        let path_hash1 = &self.path_hash1;
+        self.path_table
+            .insert_unique(h1, next_id, |&id| path_hash1[id as usize]);
+        self.path_cache[slot] = (h1, next_id);
         self.last_path_id = Some(next_id);
         next_id
     }
@@ -880,6 +892,28 @@ impl Engine {
             hash_bytes(&norm_bytes[off..off + len])
         });
         next_id
+    }
+
+    /// Borrowed normalized path bytes (native coordinator merge).
+    pub fn norm_path(&self, mode: u8, norm_id: usize) -> Option<&[u8]> {
+        let m = mode as usize;
+        if m > 2 {
+            return None;
+        }
+        if m == NormalizeMode::Exact as usize {
+            if norm_id >= self.path_off.len() {
+                return None;
+            }
+            let off = self.path_off[norm_id] as usize;
+            let len = self.path_len[norm_id] as usize;
+            return Some(&self.path_bytes[off..off + len]);
+        }
+        if norm_id >= self.norm_off[m].len() {
+            return None;
+        }
+        let off = self.norm_off[m][norm_id] as usize;
+        let len = self.norm_len[m][norm_id] as usize;
+        Some(&self.norm_bytes[m][off..off + len])
     }
 
     pub fn norm_path_bytes(&self, mode: u8, norm_id: usize) -> Option<Vec<u8>> {
@@ -952,6 +986,44 @@ impl Engine {
         date_filter: &[u8],
         need_summary: bool,
     ) -> Vec<u8> {
+        let partial = self.reaggregate_partial(
+            normalize_mode,
+            status_family,
+            min_ms,
+            date_filter,
+            need_summary,
+        );
+        self.encode_partial(&partial)
+    }
+
+    /// Encode a structured partial exactly like [`Self::reaggregate`] does.
+    pub fn encode_partial(&self, partial: &EnginePartial) -> Vec<u8> {
+        let mode = partial.mode as usize;
+        let (norm_bytes, norm_off, norm_len) = if mode == NormalizeMode::Exact as usize {
+            (&self.path_bytes, &self.path_off, &self.path_len)
+        } else {
+            (&self.norm_bytes[mode], &self.norm_off[mode], &self.norm_len[mode])
+        };
+        encode_partial_vec(
+            partial.mode,
+            &partial.endpoints,
+            norm_bytes,
+            norm_off,
+            norm_len,
+            partial.summary.as_ref(),
+            partial.matched,
+            partial.unmatched,
+        )
+    }
+
+    pub fn reaggregate_partial(
+        &mut self,
+        normalize_mode: u8,
+        status_family: u8,
+        min_ms: f32,
+        date_filter: &[u8],
+        need_summary: bool,
+    ) -> EnginePartial {
         self.ensure_mode(normalize_mode);
         let mode = NormalizeMode::from_u8(normalize_mode) as usize;
         let (status_min, status_max) = match status_family {
@@ -1135,38 +1207,37 @@ impl Engine {
             }
         }
 
-        let (norm_bytes, norm_off, norm_len) = if mode == NormalizeMode::Exact as usize {
-            (&self.path_bytes, &self.path_off, &self.path_len)
-        } else {
-            (&self.norm_bytes[mode], &self.norm_off[mode], &self.norm_len[mode])
-        };
-
-        let summary_ref: Option<&RelHist> = if !need_summary {
+        let summary = if !need_summary {
             None
         } else if use_cached_summary {
-            Some(&self.summary_sketch)
+            Some(SummaryAcc {
+                sum: sum_sum,
+                max: sum_max,
+                errors: sum_errors,
+                slow: sum_slow,
+                sketch: self.summary_sketch.clone(),
+            })
         } else {
-            Some(&custom_summary)
+            Some(SummaryAcc {
+                sum: sum_sum,
+                max: sum_max,
+                errors: sum_errors,
+                slow: sum_slow,
+                sketch: custom_summary,
+            })
         };
 
-        encode_partial_vec(
-            mode as u8,
-            &endpoints,
-            norm_bytes,
-            norm_off,
-            norm_len,
-            summary_ref,
-            sum_sum,
-            sum_max,
-            sum_errors,
-            sum_slow,
-            matched_count,
-            if target_date_id == 0 {
+        EnginePartial {
+            mode: mode as u8,
+            matched: matched_count,
+            unmatched: if target_date_id == 0 {
                 self.unmatched_count
             } else {
                 0
             },
-        )
+            endpoints,
+            summary,
+        }
     }
 
     pub fn cron_wire(&self) -> Vec<u8> {
@@ -1261,11 +1332,7 @@ fn encode_partial_vec(
     norm_bytes: &[u8],
     norm_off: &[u32],
     norm_len: &[u16],
-    summary: Option<&RelHist>,
-    sum_sum: f64,
-    sum_max: f32,
-    sum_errors: u32,
-    sum_slow: u32,
+    summary: Option<&SummaryAcc>,
     matched: u32,
     unmatched: u32,
 ) -> Vec<u8> {
@@ -1279,12 +1346,12 @@ fn encode_partial_vec(
     out.extend_from_slice(&matched.to_le_bytes());
     out.extend_from_slice(&unmatched.to_le_bytes());
 
-    if let Some(sk) = summary {
-        out.extend_from_slice(&sum_sum.to_le_bytes());
-        out.extend_from_slice(&sum_max.to_le_bytes());
-        out.extend_from_slice(&sum_errors.to_le_bytes());
-        out.extend_from_slice(&sum_slow.to_le_bytes());
-        let wire = sk.to_wire();
+    if let Some(acc) = summary {
+        out.extend_from_slice(&acc.sum.to_le_bytes());
+        out.extend_from_slice(&acc.max.to_le_bytes());
+        out.extend_from_slice(&acc.errors.to_le_bytes());
+        out.extend_from_slice(&acc.slow.to_le_bytes());
+        let wire = acc.sketch.to_wire();
         out.extend_from_slice(&(wire.len() as u32).to_le_bytes());
         out.extend_from_slice(&wire);
     }
@@ -1347,6 +1414,65 @@ socket connected\n\
         assert_eq!(a.unmatched_count(), b.unmatched_count());
         assert_eq!(a.hit_count(), 2);
         assert_eq!(a.unmatched_count(), 1);
+    }
+
+    #[test]
+    fn feed_slice_matches_chunked_feed_at_every_boundary() {
+        // Long lines > chunk size so every line spans at least one boundary, plus a
+        // leading partial line for the skip_partial path and a trailing partial line
+        // at EOF without a newline.
+        let mut sample = Vec::new();
+        sample.extend_from_slice(b"half a line before the shard\n");
+        for i in 0..64 {
+            let path = format!("/api/very/long/endpoint/segment/{i}/with/trailing/query?id={i}\n");
+            sample.extend_from_slice(
+                format!("2026-07-24T00:00:{:02}: GET {path} 200 {i}.5 ms - 42\n", i % 60)
+                    .as_bytes(),
+            );
+            sample.extend_from_slice(b"socket noise line that is long enough to span a boundary\n");
+        }
+        sample.extend_from_slice(b"tail line without newline");
+
+        let render = |engine: &mut Engine| {
+            let mut bytes = engine.reaggregate(2, 0, 0.0, b"", true);
+            bytes.push(engine.hit_count() as u8);
+            bytes.push(engine.unmatched_count() as u8);
+            bytes
+        };
+
+        let shard_start = 32u64; // mid-line
+        let shard_end = sample.len() as u64 - 10; // mid-line
+        let reference = {
+            let mut engine = Engine::new();
+            engine.begin_shard(shard_start, shard_end, sample.len() as u64);
+            engine.feed_slice(&sample[shard_start as usize - 1..shard_end as usize], shard_start - 1);
+            engine.end_shard();
+            render(&mut engine)
+        };
+
+        for chunk in [1usize, 3, 16, 64, 257] {
+            let mut engine = Engine::new();
+            engine.begin_shard(shard_start, shard_end, sample.len() as u64);
+            let mut off = shard_start - 1;
+            while off < shard_end {
+                let take = ((shard_end - off) as usize).min(chunk);
+                engine.feed_slice(&sample[off as usize..off as usize + take], off);
+                off += take as u64;
+            }
+            engine.end_shard();
+            assert_eq!(render(&mut engine), reference, "feed_slice chunk {chunk}");
+
+            let mut engine = Engine::new();
+            engine.begin_shard(shard_start, shard_end, sample.len() as u64);
+            let mut off = shard_start - 1;
+            while off < shard_end {
+                let take = ((shard_end - off) as usize).min(chunk);
+                engine.feed_bytes(&sample[off as usize..off as usize + take], off);
+                off += take as u64;
+            }
+            engine.end_shard();
+            assert_eq!(render(&mut engine), reference, "feed_bytes chunk {chunk}");
+        }
     }
 
     #[test]

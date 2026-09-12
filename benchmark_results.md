@@ -296,3 +296,22 @@ Dataset: 5.22 GB log file (c:/Users/My_Home/Desktop/projects/pm2-logs/pm2-log-an
 4. Average Filter Toggle Response:       339.25 ms
 ================================================================
 ```
+
+---
+
+## 🕒 Benchmark Run 6: 2026-09-12 (native shard/fingerprint/zero-copy/structured-merge pass)
+
+Command: `target/release/bench.exe c:/Users/My_Home/Desktop/projects/pm2-logs/pm2-log-analyzer/test_data/api-out-5gb.log`
+
+```text
+file          : 5610270930
+shards        : 12
+parse wall    : 1693.5 ms
+throughput    : 3159 MB/s
+first reagg   : 46.8 ms
+matched hits  : 20315200
+unmatched     : 33123400
+endpoints     : 5416
+cron jobs     : 9
+p95           : 2416.9 ms
+```

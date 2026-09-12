@@ -11,23 +11,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chrono::{Local, NaiveDateTime, TimeZone};
-use memmap2::Mmap;
+use memmap2::MmapOptions;
 use rayon::prelude::*;
 
 use crate::core::models::*;
-use crate::core::relhist_js::{
-    read_f32, read_f64, read_u16, read_u32, RelHist, RelHistWire,
-};
-use crate::kernels::pm2::store::Engine;
+use crate::core::relhist_js::{read_f32, read_u32};
+use crate::kernels::pm2::relhist::RelHist as KernelRelHist;
+use crate::kernels::pm2::store::{Engine, EnginePartial, HourlyAcc};
 
 pub const SHARD_MIN_BYTES: u64 = 8 * 1024 * 1024;
 const FEED_CHUNK: usize = 16 * 1024 * 1024;
 const LINE_EXTEND: u64 = 256 * 1024;
 const UNMATCHED_SAMPLE_CAP: usize = 40;
-
-const MAGIC_PM2P: u32 = 0x504d_3250;
-const MAGIC_PM2H: u32 = 0x504d_3248;
-const MAGIC_PM2D: u32 = 0x504d_3244;
 
 /// Byte budget / cancellation probe shared with the UI thread.
 pub struct JobControl {
@@ -103,7 +98,11 @@ impl LoadedSource {
 
 enum SourcePart {
     Shared(Arc<Vec<u8>>),
-    Mapped(Arc<Mmap>),
+    /// File kept open; each walk maps only the segment it feeds. Mapping per
+    /// segment (instead of one huge view) lets the kernel unmap in parallel
+    /// inside the shard workers — a 5.6 GB view teardown is otherwise a serial
+    /// ~600 ms page-table walk at the end of the parse.
+    File(Arc<std::fs::File>),
 }
 
 struct Source {
@@ -137,10 +136,7 @@ impl Source {
                         })?
                         .len();
                     if len > 0 {
-                        let map = unsafe { Mmap::map(&file) }.map_err(|e| {
-                            ParseError::Io(format!("Failed to map {}: {e}", path.display()))
-                        })?;
-                        parts.push(SourcePart::Mapped(Arc::new(map)));
+                        parts.push(SourcePart::File(Arc::new(file)));
                         acc += len;
                         part_ends.push(acc);
                     }
@@ -166,7 +162,12 @@ impl Source {
     }
 
     /// Walk `[start, end)` across source boundaries, yielding `(abs_offset, bytes)`.
-    fn for_each_segment(&self, start: u64, end: u64, mut f: impl FnMut(u64, &[u8])) {
+    fn for_each_segment(
+        &self,
+        start: u64,
+        end: u64,
+        mut f: impl FnMut(u64, &[u8]) -> Result<(), ParseError>,
+    ) -> Result<(), ParseError> {
         let mut part_start = 0u64;
         for (i, part) in self.parts.iter().enumerate() {
             let part_end = self.ends[i];
@@ -177,16 +178,30 @@ impl Source {
                 let seg_start = start.max(part_start);
                 let seg_end = end.min(part_end);
                 if seg_start < seg_end {
-                    let local = (seg_start - part_start) as usize;
-                    let local_end = (seg_end - part_start) as usize;
                     match part {
-                        SourcePart::Shared(bytes) => f(seg_start, &bytes[local..local_end]),
-                        SourcePart::Mapped(map) => f(seg_start, &map[local..local_end]),
+                        SourcePart::Shared(bytes) => {
+                            let local = (seg_start - part_start) as usize;
+                            let local_end = (seg_end - part_start) as usize;
+                            f(seg_start, &bytes[local..local_end])?;
+                        }
+                        SourcePart::File(file) => {
+                            let offset = seg_start - part_start;
+                            let len = (seg_end - seg_start) as usize;
+                            let map = unsafe {
+                                MmapOptions::new()
+                                    .offset(offset)
+                                    .len(len)
+                                    .map(file.as_ref())
+                            }
+                            .map_err(|e| ParseError::Io(format!("Failed to map: {e}")))?;
+                            f(seg_start, &map)?;
+                        }
                     }
                 }
             }
             part_start = part_end;
         }
+        Ok(())
     }
 }
 
@@ -200,7 +215,8 @@ pub fn pool_size() -> usize {
         .unwrap_or(4);
     match std::env::var("PM2_ANALYZER_SHARDS").ok().and_then(|v| v.parse::<usize>().ok()) {
         Some(n) if n > 0 => n.clamp(1, 64),
-        _ => hc.clamp(2, 4),
+        // No per-worker Wasm memory here: shard across all logical cores.
+        _ => hc.clamp(2, 16),
     }
 }
 
@@ -244,8 +260,8 @@ pub fn shard_ranges(file_size: u64, n: usize) -> Vec<ShardRange> {
 
 struct Shard {
     engine: Engine,
-    /// Prekicked partial wire produced at parse time (default filters).
-    default_partial: Option<(NormalizeMode, Vec<u8>)>,
+    /// Prekicked partial produced at parse time (default filters).
+    default_partial: Option<(NormalizeMode, EnginePartial)>,
 }
 
 struct ShardParsed {
@@ -256,10 +272,8 @@ struct ShardParsed {
     methods_mask: u8,
     cron_wire: Vec<u8>,
     unmatched_wire: Vec<u8>,
-    hourly_wire: Vec<u8>,
     dates_wire: Vec<u8>,
-    daily_wire: Vec<u8>,
-    default_partial: Option<(NormalizeMode, Vec<u8>)>,
+    default_partial: Option<(NormalizeMode, EnginePartial)>,
 }
 
 fn feed_shard(
@@ -280,8 +294,9 @@ fn feed_shard(
         let take = ((read_end - off) as usize).min(FEED_CHUNK);
         let chunk_end = off + take as u64;
         source.for_each_segment(off, chunk_end, |abs, bytes| {
-            engine.feed_bytes(bytes, abs);
-        });
+            engine.feed_slice(bytes, abs);
+            Ok(())
+        })?;
         control.processed.fetch_add(take as u64, Ordering::Relaxed);
         off = chunk_end;
     }
@@ -307,7 +322,7 @@ fn parse_one_shard(
         control,
     )?;
     engine.ensure_mode(normalize_mode.code());
-    let partial_wire = engine.reaggregate(normalize_mode.code(), 0, 0.0, b"", true);
+    let partial = engine.reaggregate_partial(normalize_mode.code(), 0, 0.0, b"", true);
     Ok(ShardParsed {
         shard_index,
         hit_count: engine.hit_count() as u64,
@@ -315,10 +330,8 @@ fn parse_one_shard(
         methods_mask: engine.methods_mask(),
         cron_wire: engine.cron_wire(),
         unmatched_wire: engine.unmatched_sample_wire(),
-        hourly_wire: engine.hourly_wire(),
         dates_wire: engine.dates_wire(),
-        daily_wire: engine.daily_wire(),
-        default_partial: Some((normalize_mode, partial_wire)),
+        default_partial: Some((normalize_mode, partial)),
         engine,
     })
 }
@@ -363,41 +376,39 @@ impl Pm2Kernel {
             Vec::new()
         };
 
-        let decoded: Vec<(u64, u64, AggPartial)> = self
+        let mut partials: Vec<EnginePartial> = self
             .shards
             .par_iter_mut()
             .map(|shard| {
                 if use_prekick {
-                    if let Some((pre_mode, wire)) = shard.default_partial.take() {
+                    if let Some((pre_mode, partial)) = shard.default_partial.take() {
                         if pre_mode == mode {
-                            return decode_pm2_partial(&wire);
+                            return partial;
                         }
                     }
                 }
-                let wire = shard.engine.reaggregate(
+                shard.engine.reaggregate_partial(
                     mode.code(),
                     opts.status_family.code(),
                     opts.min_ms as f32,
                     &date_bytes,
                     need_summary,
-                );
-                decode_pm2_partial(&wire)
+                )
             })
             .collect();
 
         let mut total_matched = 0u64;
         let mut total_unmatched = 0u64;
-        let mut partials: Vec<AggPartial> = Vec::with_capacity(decoded.len());
-        for (matched, unmatched, mut partial) in decoded {
-            total_matched += matched;
-            total_unmatched += unmatched;
+        for partial in &mut partials {
+            total_matched += partial.matched as u64;
+            total_unmatched += partial.unmatched as u64;
             if !need_summary {
                 partial.summary = None;
             }
-            partials.push(partial);
         }
 
-        let (api, built) = finish_api_from_partials(&partials, total_matched, total_unmatched);
+        let (api, built) =
+            finish_api_from_partials(&self.shards, partials, total_matched, total_unmatched, mode);
         let cron = aggregate_cron(&self.cron_events, opts);
 
         let summary = if is_date_filtered {
@@ -559,17 +570,24 @@ pub fn parse_paths_wires(
     parsed.sort_by_key(|p| p.shard_index);
     Ok(parsed
         .into_iter()
-        .map(|p| ShardWireDump {
-            shard_index: p.shard_index,
-            hit_count: p.hit_count,
-            unmatched_count: p.unmatched_count,
-            methods_mask: p.methods_mask,
-            cron_wire: p.cron_wire,
-            unmatched_wire: p.unmatched_wire,
-            hourly_wire: p.hourly_wire,
-            dates_wire: p.dates_wire,
-            daily_wire: p.daily_wire,
-            partial_wire: p.default_partial.map(|(_, w)| w).unwrap_or_default(),
+        .map(|p| {
+            let partial_wire = p
+                .default_partial
+                .as_ref()
+                .map(|(_, partial)| p.engine.encode_partial(partial))
+                .unwrap_or_default();
+            ShardWireDump {
+                shard_index: p.shard_index,
+                hit_count: p.hit_count,
+                unmatched_count: p.unmatched_count,
+                methods_mask: p.methods_mask,
+                cron_wire: p.cron_wire,
+                unmatched_wire: p.unmatched_wire,
+                hourly_wire: p.engine.hourly_wire(),
+                dates_wire: p.dates_wire,
+                daily_wire: p.engine.daily_wire(),
+                partial_wire,
+            }
         })
         .collect())
 }
@@ -581,18 +599,14 @@ fn absorb_meta(parsed: Vec<ShardParsed>, file_size: u64) -> Pm2Kernel {
     let mut unmatched_sample: Vec<String> = Vec::new();
     let mut cron_events: Vec<CronEventCompact> = Vec::new();
     let mut all_dates: Vec<String> = Vec::new();
-    let mut hourly_partials: Vec<HourlyPartial> = Vec::new();
-    let mut daily_partials: Vec<DailyPartial> = Vec::new();
     let mut shards: Vec<Shard> = Vec::with_capacity(parsed.len());
 
     for p in parsed {
         hit_count += p.hit_count;
         unmatched_count += p.unmatched_count;
         methods_mask |= p.methods_mask;
-        hourly_partials.push(decode_hourly_wire(&p.hourly_wire));
         cron_events.extend(decode_cron_wire(&p.cron_wire));
         all_dates.extend(decode_dates_wire(&p.dates_wire));
-        daily_partials.push(decode_daily_wire(&p.daily_wire));
         if unmatched_sample.len() < UNMATCHED_SAMPLE_CAP {
             for line in decode_unmatched_wire(&p.unmatched_wire) {
                 if unmatched_sample.len() >= UNMATCHED_SAMPLE_CAP {
@@ -607,8 +621,8 @@ fn absorb_meta(parsed: Vec<ShardParsed>, file_size: u64) -> Pm2Kernel {
         });
     }
 
-    let hourly_stats = finalize_hourly_stats(&merge_hourly_partials(&hourly_partials));
-    let daily_stats = finalize_daily_stats(&merge_daily_partials(&daily_partials));
+    let hourly_stats = finalize_hourly_stats(&merge_hourly_accs(&shards));
+    let daily_stats = finalize_daily_stats(&merge_daily_accs(&shards));
     let mut dates = all_dates;
     dates.sort();
     dates.dedup();
@@ -630,103 +644,6 @@ fn absorb_meta(parsed: Vec<ShardParsed>, file_size: u64) -> Pm2Kernel {
 }
 
 // ── Wire decoding ───────────────────────────────────────────────────────────
-
-pub struct AggPartial {
-    pub buckets: Vec<NormBucketWire>,
-    pub summary: Option<SummaryWire>,
-}
-
-pub struct NormBucketWire {
-    pub method: LogMethod,
-    pub path: String,
-    pub sketch: RelHistWire,
-    pub count: u64,
-    pub sum: f64,
-    pub min: f64,
-    pub max: f64,
-    pub error_count: u64,
-}
-
-pub struct SummaryWire {
-    pub sum: f64,
-    pub max: f64,
-    pub errors: u64,
-    pub slow: u64,
-    pub sketch: RelHistWire,
-}
-
-fn decode_pm2_partial(buf: &[u8]) -> (u64, u64, AggPartial) {
-    let mut o = 0usize;
-    assert_eq!(read_u32(buf, o), MAGIC_PM2P, "bad PM2P magic");
-    o += 4;
-    let version = read_u16(buf, o);
-    o += 2;
-    assert_eq!(version, 1, "unsupported PM2P version");
-    o += 1; // mode
-    let flags = buf[o];
-    o += 1;
-    let endpoint_count = read_u32(buf, o) as usize;
-    o += 4;
-    let matched = read_u32(buf, o) as u64;
-    o += 4;
-    let unmatched = read_u32(buf, o) as u64;
-    o += 4;
-
-    let mut summary = None;
-    if flags & 1 != 0 {
-        let sum = read_f64(buf, o);
-        o += 8;
-        let max = read_f32(buf, o) as f64;
-        o += 4;
-        let errors = read_u32(buf, o) as u64;
-        o += 4;
-        let slow = read_u32(buf, o) as u64;
-        o += 4;
-        o += 4; // sketch length
-        let sketch = RelHistWire::decode(buf, &mut o);
-        summary = Some(SummaryWire {
-            sum,
-            max,
-            errors,
-            slow,
-            sketch,
-        });
-    }
-
-    let mut buckets = Vec::with_capacity(endpoint_count);
-    for _ in 0..endpoint_count {
-        let method_code = buf[o] as usize;
-        o += 4;
-        let count = read_u32(buf, o) as u64;
-        o += 4;
-        let sum = read_f64(buf, o);
-        o += 8;
-        let min = read_f32(buf, o) as f64;
-        o += 4;
-        let max = read_f32(buf, o) as f64;
-        o += 4;
-        let error_count = read_u32(buf, o) as u64;
-        o += 4;
-        let path_len = read_u32(buf, o) as usize;
-        o += 4;
-        let path = String::from_utf8_lossy(&buf[o..o + path_len]).into_owned();
-        o += path_len;
-        o += 4; // sketch length
-        let sketch = RelHistWire::decode(buf, &mut o);
-        buckets.push(NormBucketWire {
-            method: LogMethod::from_index(method_code),
-            path,
-            sketch,
-            count,
-            sum,
-            min,
-            max,
-            error_count,
-        });
-    }
-
-    (matched, unmatched, AggPartial { buckets, summary })
-}
 
 fn read_bytes(buf: &[u8], o: &mut usize) -> Vec<u8> {
     let len = read_u32(buf, *o) as usize;
@@ -800,181 +717,80 @@ pub fn decode_dates_wire(buf: &[u8]) -> Vec<String> {
     out
 }
 
-#[derive(Clone)]
-pub struct HourlyBucketPartial {
-    pub count: u64,
-    pub error_count: u64,
-    pub sum: f64,
-    pub max: f64,
-    pub sketch: RelHistWire,
-}
-
-pub struct HourlyPartial {
-    pub buckets: Vec<HourlyBucketPartial>,
-}
-
-pub fn decode_hourly_wire(buf: &[u8]) -> HourlyPartial {
-    let mut o = 0usize;
-    assert_eq!(read_u32(buf, o), MAGIC_PM2H, "bad PM2H magic");
-    o += 4;
-    let version = read_u16(buf, o);
-    assert_eq!(version, 1, "unsupported PM2H version");
-    o += 2;
-    let bucket_count = read_u16(buf, o) as usize;
-    o += 2;
-    let mut buckets = Vec::with_capacity(bucket_count);
-    for _ in 0..bucket_count {
-        let count = read_u32(buf, o) as u64;
-        let error_count = read_u32(buf, o + 4) as u64;
-        let sum = read_f64(buf, o + 8);
-        let max = read_f32(buf, o + 16) as f64;
-        o += 24;
-        let sketch = RelHistWire::decode(buf, &mut o);
-        buckets.push(HourlyBucketPartial {
-            count,
-            error_count,
-            sum,
-            max,
-            sketch,
-        });
-    }
-    HourlyPartial { buckets }
-}
-
-pub struct DayMerged {
-    pub date: String,
-    pub count: u64,
-    pub error_count: u64,
-    pub slow_count: u64,
-    pub sum: f64,
-    pub max: f64,
-    pub sketch: RelHistWire,
-    pub hourly: Vec<HourlyBucketPartial>,
-}
-
-pub struct DailyPartial {
-    pub days: Vec<DayMerged>,
-}
-
-pub fn decode_daily_wire(buf: &[u8]) -> DailyPartial {
-    if buf.len() < 8 {
-        return DailyPartial { days: Vec::new() };
-    }
-    let mut o = 0usize;
-    assert_eq!(read_u32(buf, o), MAGIC_PM2D, "bad PM2D magic");
-    o += 4;
-    let version = read_u16(buf, o);
-    assert_eq!(version, 1, "unsupported PM2D version");
-    o += 2;
-    let day_count = read_u16(buf, o) as usize;
-    o += 2;
-
-    let mut days = Vec::with_capacity(day_count);
-    for _ in 0..day_count {
-        let date = String::from_utf8_lossy(&buf[o..o + 10]).into_owned();
-        o += 12;
-        let count = read_u32(buf, o) as u64;
-        let error_count = read_u32(buf, o + 4) as u64;
-        let slow_count = read_u32(buf, o + 8) as u64;
-        let sum = read_f64(buf, o + 12);
-        let max = read_f32(buf, o + 20) as f64;
-        o += 28;
-        let sketch = RelHistWire::decode(buf, &mut o);
-
-        let mut hourly = Vec::with_capacity(24);
-        for _ in 0..24 {
-            let h_count = read_u32(buf, o) as u64;
-            let h_error = read_u32(buf, o + 4) as u64;
-            let h_sum = read_f64(buf, o + 8);
-            let h_max = read_f32(buf, o + 16) as f64;
-            o += 24;
-            let h_sketch = RelHistWire::decode(buf, &mut o);
-            hourly.push(HourlyBucketPartial {
-                count: h_count,
-                error_count: h_error,
-                sum: h_sum,
-                max: h_max,
-                sketch: h_sketch,
-            });
-        }
-        days.push(DayMerged {
-            date,
-            count,
-            error_count,
-            slow_count,
-            sum,
-            max,
-            sketch,
-            hourly,
-        });
-    }
-    DailyPartial { days }
-}
-
 // ── Coordinator merge (finishApiFromPartials parity) ────────────────────────
 
 struct Merged {
     method: LogMethod,
     path: String,
-    sketch: RelHist,
+    /// Boxed so `rows` growth/dedup moves pointers, not the 2 KiB dense sketch
+    /// (exact/stripQuery modes merge hundreds of thousands of endpoints).
+    sketch: Box<KernelRelHist>,
     count: u64,
     sum: f64,
-    min: f64,
-    max: f64,
+    min: f32,
+    max: f32,
     error_count: u64,
 }
 
 fn finish_api_from_partials(
-    partials: &[AggPartial],
+    shards: &[Shard],
+    partials: Vec<EnginePartial>,
     total_matched: u64,
     total_unmatched: u64,
+    mode: NormalizeMode,
 ) -> (Vec<AggregatedEndpoint>, Option<LogSummary>) {
     let mut rows: Vec<Merged> = Vec::new();
     let mut index: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
-    let mut sum_sketch: Option<RelHist> = None;
+    let mut sum_sketch: Option<KernelRelHist> = None;
     let mut sum_sum = 0.0f64;
     let mut sum_max = 0.0f64;
     let mut sum_errors = 0u64;
     let mut sum_slow = 0u64;
+    let mut key_buf = String::new();
 
-    for p in partials {
-        if let Some(s) = &p.summary {
-            let sketch = sum_sketch.get_or_insert_with(RelHist::new);
-            sketch.merge_wire(&s.sketch);
-            sum_sum += s.sum;
-            if s.max > sum_max {
-                sum_max = s.max;
+    for (shard_index, partial) in partials.into_iter().enumerate() {
+        if let Some(summary) = &partial.summary {
+            let sketch = sum_sketch.get_or_insert_with(KernelRelHist::new);
+            sketch.merge(&summary.sketch);
+            sum_sum += summary.sum;
+            if summary.max as f64 > sum_max {
+                sum_max = summary.max as f64;
             }
-            sum_errors += s.errors;
-            sum_slow += s.slow;
+            sum_errors += summary.errors as u64;
+            sum_slow += summary.slow as u64;
         }
-        for b in &p.buckets {
-            let key = format!("{} {}", b.method.as_str(), b.path);
-            if let Some(&idx) = index.get(&key) {
+        let engine = &shards[shard_index].engine;
+        for (norm_id, bucket) in partial.endpoints {
+            let method = LogMethod::from_index(bucket.method as usize);
+            let path = engine.norm_path(mode.code(), norm_id as usize).unwrap_or(b"");
+            key_buf.clear();
+            key_buf.push_str(method.as_str());
+            key_buf.push(' ');
+            key_buf.push_str(&String::from_utf8_lossy(path));
+            if let Some(&idx) = index.get(key_buf.as_str()) {
                 let dest = &mut rows[idx];
-                dest.sketch.merge_wire(&b.sketch);
-                dest.count += b.count;
-                dest.sum += b.sum;
-                if b.min < dest.min {
-                    dest.min = b.min;
+                dest.sketch.merge(&bucket.sketch);
+                dest.count += bucket.count as u64;
+                dest.sum += bucket.sum;
+                if bucket.min < dest.min {
+                    dest.min = bucket.min;
                 }
-                if b.max > dest.max {
-                    dest.max = b.max;
+                if bucket.max > dest.max {
+                    dest.max = bucket.max;
                 }
-                dest.error_count += b.error_count;
+                dest.error_count += bucket.error_count as u64;
             } else {
-                let mut sketch = RelHist::new();
-                sketch.merge_wire(&b.sketch);
-                index.insert(key.clone(), rows.len());
+                index.insert(key_buf.clone(), rows.len());
+                let path = String::from_utf8_lossy(path).into_owned();
                 rows.push(Merged {
-                    method: b.method,
-                    path: b.path.clone(),
-                    sketch,
-                    count: b.count,
-                    sum: b.sum,
-                    min: b.min,
-                    max: b.max,
-                    error_count: b.error_count,
+                    method,
+                    path,
+                    sketch: Box::new(bucket.sketch),
+                    count: bucket.count as u64,
+                    sum: bucket.sum,
+                    min: bucket.min,
+                    max: bucket.max,
+                    error_count: bucket.error_count as u64,
                 });
             }
         }
@@ -995,8 +811,8 @@ fn finish_api_from_partials(
                 p90_ms: p90,
                 p95_ms: p95,
                 p99_ms: p99,
-                min_ms: if c > 0 { v.min } else { 0.0 },
-                max_ms: if c > 0 { v.max } else { 0.0 },
+                min_ms: if c > 0 { v.min as f64 } else { 0.0 },
+                max_ms: if c > 0 { v.max as f64 } else { 0.0 },
                 error_count: v.error_count,
             }
         })
@@ -1173,18 +989,20 @@ pub fn aggregate_cron(events: &[CronEventCompact], options: &ParseOptions) -> Ve
 
 // ── Hourly / daily finalization ─────────────────────────────────────────────
 
-pub fn merge_hourly_partials(partials: &[HourlyPartial]) -> HourlyPartial {
-    let mut buckets: Vec<HourlyBucketPartial> = (0..24)
-        .map(|_| HourlyBucketPartial {
-            count: 0,
-            error_count: 0,
-            sum: 0.0,
-            max: 0.0,
-            sketch: RelHistWire::default(),
-        })
-        .collect();
-    for partial in partials {
-        for (hour, source) in partial.buckets.iter().enumerate().take(24) {
+fn empty_hourly_accs() -> [HourlyAcc; 24] {
+    std::array::from_fn(|_| HourlyAcc {
+        count: 0,
+        error_count: 0,
+        sum: 0.0,
+        max: 0.0,
+        sketch: KernelRelHist::new(),
+    })
+}
+
+fn merge_hourly_accs(shards: &[Shard]) -> [HourlyAcc; 24] {
+    let mut buckets = empty_hourly_accs();
+    for shard in shards {
+        for (hour, source) in shard.engine.hourly_accs().iter().enumerate() {
             let target = &mut buckets[hour];
             target.count += source.count;
             target.error_count += source.error_count;
@@ -1192,85 +1010,82 @@ pub fn merge_hourly_partials(partials: &[HourlyPartial]) -> HourlyPartial {
             if source.max > target.max {
                 target.max = source.max;
             }
-            let mut merged = RelHist::new();
-            merged.merge_wire(&target.sketch);
-            merged.merge_wire(&source.sketch);
-            target.sketch = merged.to_wire();
+            target.sketch.merge(&source.sketch);
         }
     }
-    HourlyPartial { buckets }
+    buckets
 }
 
-pub fn finalize_hourly_stats(partial: &HourlyPartial) -> Vec<HourlyBucket> {
-    partial
-        .buckets
+fn finalize_hourly_stats(buckets: &[HourlyAcc; 24]) -> Vec<HourlyBucket> {
+    buckets
         .iter()
         .enumerate()
-        .map(|(hour, bucket)| {
-            let mut sketch = RelHist::new();
-            sketch.merge_wire(&bucket.sketch);
-            HourlyBucket {
-                hour: hour as u8,
-                label: format!("{hour:02}:00"),
-                count: bucket.count,
-                error_count: bucket.error_count,
-                avg_ms: if bucket.count > 0 {
-                    (bucket.sum / bucket.count as f64).round()
-                } else {
-                    0.0
-                },
-                p95_ms: sketch.quantile(0.95).round(),
-                p99_ms: sketch.quantile(0.99).round(),
-                max_ms: bucket.max.round(),
-            }
+        .map(|(hour, bucket)| HourlyBucket {
+            hour: hour as u8,
+            label: format!("{hour:02}:00"),
+            count: bucket.count as u64,
+            error_count: bucket.error_count as u64,
+            avg_ms: if bucket.count > 0 {
+                (bucket.sum / bucket.count as f64).round()
+            } else {
+                0.0
+            },
+            p95_ms: bucket.sketch.quantile(0.95).round(),
+            p99_ms: bucket.sketch.quantile(0.99).round(),
+            max_ms: (bucket.max as f64).round(),
         })
         .collect()
 }
 
-pub fn merge_daily_partials(partials: &[DailyPartial]) -> Vec<DayMerged> {
-    let mut map: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+struct DayMerged {
+    date: [u8; 10],
+    count: u64,
+    error_count: u64,
+    slow_count: u64,
+    sum: f64,
+    max: f64,
+    sketch: KernelRelHist,
+    hourly: [HourlyAcc; 24],
+}
+
+fn merge_daily_accs(shards: &[Shard]) -> Vec<DayMerged> {
+    let mut index: hashbrown::HashMap<[u8; 10], usize> = hashbrown::HashMap::new();
     let mut days: Vec<DayMerged> = Vec::new();
 
-    for partial in partials {
-        for d in &partial.days {
-            if let Some(&idx) = map.get(&d.date) {
+    for shard in shards {
+        for acc in shard.engine.daily_accs() {
+            if let Some(&idx) = index.get(&acc.date) {
                 let target = &mut days[idx];
-                target.count += d.count;
-                target.error_count += d.error_count;
-                target.slow_count += d.slow_count;
-                target.sum += d.sum;
-                if d.max > target.max {
-                    target.max = d.max;
+                target.count += acc.count as u64;
+                target.error_count += acc.error_count as u64;
+                target.slow_count += acc.slow_count as u64;
+                target.sum += acc.sum;
+                if acc.max as f64 > target.max {
+                    target.max = acc.max as f64;
                 }
-                let mut merged = RelHist::new();
-                merged.merge_wire(&target.sketch);
-                merged.merge_wire(&d.sketch);
-                target.sketch = merged.to_wire();
-                for h in 0..24 {
-                    let Some(src) = d.hourly.get(h) else { continue };
-                    let tgt = &mut target.hourly[h];
-                    tgt.count += src.count;
-                    tgt.error_count += src.error_count;
-                    tgt.sum += src.sum;
-                    if src.max > tgt.max {
-                        tgt.max = src.max;
+                target.sketch.merge(&acc.sketch);
+                for hour in 0..24 {
+                    let source = &acc.hourly[hour];
+                    let target_hour = &mut target.hourly[hour];
+                    target_hour.count += source.count;
+                    target_hour.error_count += source.error_count;
+                    target_hour.sum += source.sum;
+                    if source.max > target_hour.max {
+                        target_hour.max = source.max;
                     }
-                    let mut hmerged = RelHist::new();
-                    hmerged.merge_wire(&tgt.sketch);
-                    hmerged.merge_wire(&src.sketch);
-                    tgt.sketch = hmerged.to_wire();
+                    target_hour.sketch.merge(&source.sketch);
                 }
             } else {
-                map.insert(d.date.clone(), days.len());
+                index.insert(acc.date, days.len());
                 days.push(DayMerged {
-                    date: d.date.clone(),
-                    count: d.count,
-                    error_count: d.error_count,
-                    slow_count: d.slow_count,
-                    sum: d.sum,
-                    max: d.max,
-                    sketch: d.sketch.clone(),
-                    hourly: d.hourly.clone(),
+                    date: acc.date,
+                    count: acc.count as u64,
+                    error_count: acc.error_count as u64,
+                    slow_count: acc.slow_count as u64,
+                    sum: acc.sum,
+                    max: acc.max as f64,
+                    sketch: acc.sketch.clone(),
+                    hourly: acc.hourly.clone(),
                 });
             }
         }
@@ -1279,36 +1094,30 @@ pub fn merge_daily_partials(partials: &[DailyPartial]) -> Vec<DayMerged> {
     days
 }
 
-pub fn finalize_daily_stats(days: &[DayMerged]) -> Vec<DaySummary> {
+fn finalize_daily_stats(days: &[DayMerged]) -> Vec<DaySummary> {
     days.iter()
         .map(|d| {
-            let mut sketch = RelHist::new();
-            sketch.merge_wire(&d.sketch);
             let hourly_stats = d
                 .hourly
                 .iter()
                 .enumerate()
-                .map(|(hour, h)| {
-                    let mut h_sketch = RelHist::new();
-                    h_sketch.merge_wire(&h.sketch);
-                    HourlyBucket {
-                        hour: hour as u8,
-                        label: format!("{hour:02}:00"),
-                        count: h.count,
-                        error_count: h.error_count,
-                        avg_ms: if h.count > 0 {
-                            (h.sum / h.count as f64).round()
-                        } else {
-                            0.0
-                        },
-                        p95_ms: h_sketch.quantile(0.95).round(),
-                        p99_ms: h_sketch.quantile(0.99).round(),
-                        max_ms: h.max.round(),
-                    }
+                .map(|(hour, h)| HourlyBucket {
+                    hour: hour as u8,
+                    label: format!("{hour:02}:00"),
+                    count: h.count as u64,
+                    error_count: h.error_count as u64,
+                    avg_ms: if h.count > 0 {
+                        (h.sum / h.count as f64).round()
+                    } else {
+                        0.0
+                    },
+                    p95_ms: h.sketch.quantile(0.95).round(),
+                    p99_ms: h.sketch.quantile(0.99).round(),
+                    max_ms: (h.max as f64).round(),
                 })
                 .collect();
             DaySummary {
-                date: d.date.clone(),
+                date: String::from_utf8_lossy(&d.date).into_owned(),
                 count: d.count,
                 error_count: d.error_count,
                 slow_count: d.slow_count,
@@ -1317,8 +1126,8 @@ pub fn finalize_daily_stats(days: &[DayMerged]) -> Vec<DaySummary> {
                 } else {
                     0.0
                 },
-                p95_ms: sketch.quantile(0.95).round(),
-                p99_ms: sketch.quantile(0.99).round(),
+                p95_ms: d.sketch.quantile(0.95).round(),
+                p99_ms: d.sketch.quantile(0.99).round(),
                 max_ms: d.max.round(),
                 hourly_stats,
             }

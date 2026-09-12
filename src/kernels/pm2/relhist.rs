@@ -18,6 +18,17 @@ pub fn relhist_key(value: f32) -> Option<i32> {
     }
 }
 
+/// Bucket value used for quantiles; matches `core::relhist_js::bucket_value`
+/// (f32 table for dense keys, f64 `powf` outside it).
+#[inline]
+fn bucket_value(key: i32) -> f64 {
+    if key >= 0 && (key as usize) < DENSE_LIMIT {
+        (GAMMA.powf(key as f64 - 0.5) as f32) as f64
+    } else {
+        GAMMA.powf(key as f64 - 0.5)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RelHist {
     dense: [u32; DENSE_LIMIT],
@@ -48,6 +59,116 @@ impl RelHist {
         } else {
             *self.sparse.entry(key).or_insert(0) += 1;
         }
+    }
+
+    /// Add another sketch's bucket counts (native coordinator merge).
+    pub fn merge(&mut self, other: &RelHist) {
+        self.count += other.count;
+        for i in 0..DENSE_LIMIT {
+            self.dense[i] += other.dense[i];
+        }
+        for (&key, &count) in &other.sparse {
+            *self.sparse.entry(key).or_insert(0) += count;
+        }
+    }
+
+    /// Iterate buckets in ascending key order (same order as `to_wire`).
+    fn for_each_bucket(&self, mut f: impl FnMut(i32, u64)) {
+        let mut neg: Vec<i32> = self.sparse.keys().copied().filter(|&k| k < 0).collect();
+        neg.sort_unstable();
+        for key in neg {
+            f(key, self.sparse[&key] as u64);
+        }
+        for (key, &count) in self.dense.iter().enumerate() {
+            if count > 0 {
+                f(key as i32, count as u64);
+            }
+        }
+        let mut high: Vec<i32> = self
+            .sparse
+            .keys()
+            .copied()
+            .filter(|&k| k >= DENSE_LIMIT as i32)
+            .collect();
+        high.sort_unstable();
+        for key in high {
+            f(key, self.sparse[&key] as u64);
+        }
+    }
+
+    /// JS-parity quantile (mirrors `relHist.quantile` in the reference coordinator).
+    pub fn quantile(&self, q: f64) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        let mut first = None;
+        let mut last = 0i32;
+        self.for_each_bucket(|key, _| {
+            if first.is_none() {
+                first = Some(key);
+            }
+            last = key;
+        });
+        let first = first.unwrap_or(0);
+        if q <= 0.0 {
+            return bucket_value(first);
+        }
+        if q >= 1.0 {
+            return bucket_value(last);
+        }
+        let target = q * (self.count as f64 - 1.0);
+        let mut rank = 0u64;
+        let mut found = None;
+        self.for_each_bucket(|key, count| {
+            if found.is_none() && (rank + count) as f64 > target {
+                found = Some(key);
+            }
+            rank += count;
+        });
+        bucket_value(found.unwrap_or(last))
+    }
+
+    /// One pass for p50/p90/p95/p99 (mirrors `RelHist.quantiles4()`).
+    pub fn quantiles4(&self) -> [f64; 4] {
+        if self.count == 0 {
+            return [0.0, 0.0, 0.0, 0.0];
+        }
+        let count = self.count as f64;
+        let t50 = 0.5 * (count - 1.0);
+        let t90 = 0.9 * (count - 1.0);
+        let t95 = 0.95 * (count - 1.0);
+        let t99 = 0.99 * (count - 1.0);
+        let mut p50 = f64::NAN;
+        let mut p90 = f64::NAN;
+        let mut p95 = f64::NAN;
+        let mut p99 = f64::NAN;
+        let mut rank = 0u64;
+        let mut last = 0i32;
+        self.for_each_bucket(|key, bucket| {
+            last = key;
+            let next_rank = rank + bucket;
+            let value = bucket_value(key);
+            if p50.is_nan() && next_rank as f64 > t50 {
+                p50 = value;
+            }
+            if p90.is_nan() && next_rank as f64 > t90 {
+                p90 = value;
+            }
+            if p95.is_nan() && next_rank as f64 > t95 {
+                p95 = value;
+            }
+            if p99.is_nan() && next_rank as f64 > t99 {
+                p99 = value;
+            }
+            rank = next_rank;
+        });
+        let last_value = bucket_value(last);
+        [
+            if p50.is_nan() { last_value } else { p50 },
+            if p90.is_nan() { last_value } else { p90 },
+            if p95.is_nan() { last_value } else { p95 },
+            if p99.is_nan() { last_value } else { p99 },
+        ]
     }
 
     /// Encode as [count:u32][n:u32][key:i32, cnt:u32]×n little-endian (keys sorted).
@@ -137,6 +258,32 @@ mod tests {
             rank += c;
         }
         bucket_value(*keys.last().unwrap())
+    }
+
+    #[test]
+    fn kernel_quantiles_match_js_coordinator() {
+        use crate::core::relhist_js::{RelHist as JsRelHist, RelHistWire};
+        let mut kernel = RelHist::new();
+        let mut js = JsRelHist::new();
+        for i in 0..20_000i32 {
+            let key = match i % 5 {
+                0 => (i % 400) - 30,
+                1 => 512 + (i % 50),
+                2 => -200 + (i % 100),
+                3 => i % 511,
+                _ => 700 + (i % 20),
+            };
+            kernel.accept_key(key);
+            js.merge_wire(&RelHistWire {
+                count: 1,
+                buckets: vec![(key, 1)],
+            });
+        }
+        assert_eq!(kernel.count as u64, js.count);
+        for q in [0.0, 0.01, 0.25, 0.5, 0.9, 0.95, 0.99, 1.0] {
+            assert_eq!(kernel.quantile(q), js.quantile(q), "q={q}");
+        }
+        assert_eq!(kernel.quantiles4(), js.quantiles4());
     }
 
     #[test]
