@@ -5,3 +5,4 @@ pub mod format;
 pub mod persist;
 pub mod table_ops;
 pub mod text_fit;
+pub mod text_path;

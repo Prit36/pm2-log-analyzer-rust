@@ -39,6 +39,10 @@ pub mod lh {
 }
 
 /// Text with an explicit line box, so section heights match the reference.
+///
+/// CSS centres the font's content box inside the line box; iced always draws
+/// the text at the top of its container, so the box is explicitly centred
+/// here to keep the glyph baseline at the reference position.
 pub fn lined<'a, Message: 'a>(
     value: impl Into<String>,
     size: f32,
@@ -46,10 +50,11 @@ pub fn lined<'a, Message: 'a>(
     line_height: f32,
 ) -> iced::Element<'a, Message> {
     use iced::widget::{container, text};
-    use iced::Length;
+    use iced::{Center, Length};
 
     container(text(value.into()).size(size).font(font))
         .height(Length::Fixed(line_height))
+        .align_y(Center)
         .into()
 }
 
@@ -62,7 +67,7 @@ pub fn lined_styled<'a, Message: 'a>(
     style: fn(&iced::Theme) -> iced::widget::text::Style,
 ) -> iced::Element<'a, Message> {
     use iced::widget::{container, text};
-    use iced::Length;
+    use iced::{Center, Length};
 
     container(
         text(value.into())
@@ -71,5 +76,106 @@ pub fn lined_styled<'a, Message: 'a>(
             .style(style),
     )
     .height(Length::Fixed(line_height))
+    .align_y(Center)
     .into()
+}
+
+/// One CSS pixel of `border`, reserved in layout. iced paints borders *over*
+/// the container padding instead of adding to the box the way the CSS
+/// border-box model does, so every bordered box adds this to its padding.
+pub const BORDER: f32 = 1.0;
+
+/// Draws a dashed border over `content` (`border-2 border-dashed`), which iced
+/// containers cannot express natively.
+pub fn dashed_border<'a, Message: 'a>(
+    content: impl Into<iced::Element<'a, Message>>,
+    color: iced::Color,
+    width: f32,
+    radius: f32,
+) -> iced::Element<'a, Message> {
+    use iced::widget::{Stack, canvas};
+    use iced::{Fill, Length};
+
+    let overlay: iced::Element<'a, Message> = canvas::Canvas::new(DashedBorder {
+        color,
+        width,
+        radius,
+    })
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into();
+
+    Stack::with_children([content.into(), overlay])
+        .width(Fill)
+        .height(Length::Shrink)
+        .into()
+}
+
+struct DashedBorder {
+    color: iced::Color,
+    width: f32,
+    radius: f32,
+}
+
+impl<Message> iced::widget::canvas::Program<Message> for DashedBorder {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<iced::widget::canvas::Geometry> {
+        use iced::widget::canvas::{Frame, LineDash, Path, Stroke, stroke};
+
+        const DASH: [f32; 2] = [6.0, 5.0];
+
+        let mut frame = Frame::new(renderer, bounds.size());
+        let inset = self.width / 2.0;
+        let path = Path::rounded_rectangle(
+            iced::Point::new(inset, inset),
+            iced::Size::new(
+                (bounds.width - self.width).max(0.0),
+                (bounds.height - self.width).max(0.0),
+            ),
+            self.radius.into(),
+        );
+        frame.stroke(
+            &path,
+            Stroke {
+                width: self.width,
+                style: stroke::Style::Solid(self.color),
+                line_dash: LineDash {
+                    segments: &DASH,
+                    offset: 0,
+                },
+                ..Stroke::default()
+            },
+        );
+        vec![frame.into_geometry()]
+    }
+}
+
+/// A text label whose line box is pinned, for use inside buttons/rows.
+pub fn boxed_text<'a, Message: 'a>(
+    value: impl Into<String>,
+    size: f32,
+    font: iced::Font,
+    line_height: f32,
+    style: impl Fn(&iced::Theme) -> iced::widget::text::Style + 'a,
+) -> iced::widget::Container<'a, Message> {
+    use iced::widget::{container, text};
+    use iced::{Center, Length};
+
+    container(
+        text(value.into())
+            .size(size)
+            .font(font)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .style(style),
+    )
+    .height(Length::Fixed(line_height))
+    .align_y(Center)
 }

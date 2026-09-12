@@ -76,7 +76,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
         card = card.push(paste_editor(app));
     }
 
-    container(card).width(Fill).style(style::card).into()
+    container(card)
+        .width(Fill)
+        .padding(crate::ui::BORDER)
+        .style(style::card)
+        .into()
 }
 
 fn compact_row(app: &App) -> Element<'_, Message> {
@@ -105,20 +109,24 @@ fn compact_row(app: &App) -> Element<'_, Message> {
 
     container(
         row![
-            icons::icon(
-                "upload",
-                16.0,
-                if is_dark {
-                    style::SLATE_500
-                } else {
-                    style::SLATE_400
-                }
-            ),
-            files,
+            row![
+                icons::icon(
+                    "upload",
+                    16.0,
+                    if is_dark {
+                        style::SLATE_500
+                    } else {
+                        style::SLATE_400
+                    }
+                ),
+                files,
+            ]
+            .spacing(8)
+            .align_y(Center),
             space().width(Fill),
             actions,
         ]
-        .spacing(10)
+        .spacing(12)
         .align_y(Center)
         .padding(Padding {
             top: 10.0,
@@ -255,11 +263,21 @@ fn loaded_files(files: &[LoadedSource]) -> Element<'_, Message> {
         chips = chips.push(
             container(
                 row![
-                    text(name)
-                        .size(11)
-                        .font(style::MONO)
-                        .wrapping(iced::widget::text::Wrapping::None),
-                    text(size).size(10).style(style::text_faint),
+                    crate::ui::boxed_text(
+                        name,
+                        11.0,
+                        style::MONO,
+                        crate::ui::lh::TEXT_11,
+                        style::text_body,
+                    )
+                    .width(iced::Length::Shrink),
+                    crate::ui::boxed_text(
+                        size,
+                        10.0,
+                        style::REGULAR,
+                        crate::ui::lh::TEXT_10,
+                        style::text_faint,
+                    ),
                 ]
                 .spacing(4)
                 .align_y(Center),
@@ -427,13 +445,19 @@ fn primary_action(icon: &'static str, label: &'static str, message: Message) -> 
     button(
         row![
             icons::icon(icon, 14.0, iced::Color::WHITE),
-            text(label).size(12).font(style::MEDIUM),
+            crate::ui::boxed_text(
+                label,
+                12.0,
+                style::MEDIUM,
+                crate::ui::lh::TEXT_XS,
+                style::text_white,
+            ),
         ]
         .spacing(6)
         .align_y(Center),
     )
     .on_press(message)
-    .padding([6, 10])
+    .padding([4, 10])
     .style(style::btn_solid)
     .into()
 }
@@ -446,26 +470,35 @@ fn secondary_action(
     button(
         row![
             icons::icon(icon, 14.0, style::SLATE_500),
-            text(label).size(12).font(style::MEDIUM),
+            crate::ui::boxed_text(
+                label,
+                12.0,
+                style::MEDIUM,
+                crate::ui::lh::TEXT_XS,
+                style::text_button,
+            ),
         ]
         .spacing(6)
         .align_y(Center),
     )
     .on_press(message)
-    .padding([6, 10])
+    .padding([5, 11])
     .style(style::btn_secondary)
     .into()
 }
 
 fn cancel_button() -> Element<'static, Message> {
     button(
-        text("Cancel")
-            .size(12)
-            .font(style::MEDIUM)
-            .style(style::text_danger),
+        crate::ui::boxed_text(
+            "Cancel",
+            12.0,
+            style::MEDIUM,
+            crate::ui::lh::TEXT_XS,
+            style::text_danger,
+        ),
     )
     .on_press(Message::CancelParse)
-    .padding([4, 10])
+    .padding([5, 11])
     .style(style::btn_danger)
     .into()
 }

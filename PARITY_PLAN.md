@@ -125,21 +125,20 @@ reference app (841 slow queries, 291 COLLSCANs, 85 patterns, 62.8x scan ratio, 1
 reference's own decoders (`parity/coordinator.mts` pattern) and deep JSON compare, then add
 headless UI cases alongside the PM2 ones in `src/app.rs` tests.
 
-## Stage 5 — Archives + classification — NOT STARTED (handoff)
-- `wasm/zip-core/src/lib.rs` (256) is the whole Rust side: `FastDecompressor` (zlib-rs, raw
-  deflate `window_bits = -15`, gzip `31`) and `classify_log_name_or_content`. Vendor natively;
-  gzip can use the same code path.
-- `src/utils/zipExtractor.ts` 664: tail-65557 EOCD scan, central-directory walk, compressed
-  slice ranges, `classifyByName` (`skip` for dotfiles/__macosx/error, `mongo` for
-  `mongo|mongod`, `pm2` for `api[_-]out|pm2|out.log`, else `unknown`), `filterValidFiles`.
-- `src/workers/zipExtractWorker.ts` 206 shows the worker protocol (start/entry/extract/error/
-  done + progress); native port can run the entries in a small thread pool.
-- Wiring points in this repo: `src/ui/ingest.rs` (`pick_files`, `is_valid_file_path`,
-  drag&drop `is_valid_archive`), `LoadedSource` in `src/core/pm2.rs` (add decompressed bytes
-  variants), `App::handle_upload` in `src/app.rs` (classification + auto mode switch + the
-  reference's toasts), `src/store/app_mode_store.rs`.
-- Note: Mongo classification only becomes meaningful once Stage 4 lands; sequence Stage 4
-  before the archive routing so a dropped `.zip` with Mongo logs reaches a real parser.
+## Stage 5 — Archives + classification — DONE
+- `src/core/classify.rs`: ports `classify_by_name` and `classify_by_content` from
+  `wasm/zip-core/src/lib.rs` 1:1, categorizing logs into `Pm2`, `Mongo`, `Unknown`, or `Skip`.
+- `src/core/archive.rs`: ports decompression and extraction from `zipExtractor.ts`. Supports
+  `.zip` archives with nested `.gz` entries and standalone `.gz` files using `zip` and
+  `flate2::read::GzDecoder`, producing memory-backed `LoadedSource` items.
+- `src/app.rs`: `route_upload` automatically identifies archives, extracts them asynchronously
+  on worker threads (`Message::ArchiveExtracted`), classifies mixed contents, routes `Unknown`
+  logs to the current active tab, switches modes automatically when single-kind archives are
+  loaded, and renders the exact reference toast notifications ("Extracted X API log(s) and Y
+  MongoDB log(s)... Both tabs populated."). Non-archive log files dropped or selected are also
+  classified and routed with auto-mode switching.
+- Verified with unit and integration tests covering extraction, name/content classification,
+  nested decompression, mode switching, and multi-tab population.
 
 ## Stage 6 — Verification harness — DONE (extend per stage)
 - Data gate: `parity_runner --dump-wires` + `parity/coordinator.mts` + `parity/compare.mjs`.

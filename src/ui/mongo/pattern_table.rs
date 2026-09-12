@@ -1,16 +1,23 @@
 //! `MongoPatternTable` — query patterns with index suggestions.
+//!
+//! Reference metrics (`dump-dom.mjs --mongo`): 58px rows, a `px-3 py-2.5`
+//! `text-[11px]` header strip 37.5px tall, numeric cells `text-xs` (12/16) with
+//! the reference's per-column weights, op badges `text-[10px] font-bold
+//! uppercase tracking-wider` (13.3333px line, 0.5px tracking) and index
+//! suggestion buttons 23.33px tall (`px-2 py-1`, mono 10/13.3333).
 
 use iced::widget::{button, column, container, mouse_area, row, scrollable, space, text};
 use iced::{Center, Element, Fill, Length, Padding, Right};
 
 use crate::app::{App, Message};
-use crate::core::mongo_models::{MongoQueryPattern, MongoSortField, MongoSortDirection};
-use crate::ui::{icons, style, virtualize};
+use crate::core::mongo_models::{MongoQueryPattern, MongoSortDirection, MongoSortField};
+use crate::ui::{BORDER, boxed_text, icons, lh, style, virtualize};
 use crate::utils::format::{format_ms, format_num, format_ratio};
 use crate::utils::text_fit;
 
 const ROW_HEIGHT: f32 = 58.0;
-const HEADER_HEIGHT: f32 = 40.0;
+/// `px-3 py-2.5` (10 + 16.5) plus the 1px `border-b` drawn as a rule below.
+const HEADER_CONTENT: f32 = 36.5;
 const OVERSCAN: usize = 4;
 const COL_COUNT: f32 = 80.0;
 const COL_TOTAL: f32 = 90.0;
@@ -27,6 +34,10 @@ const NUMERIC_WIDTH: f32 = COL_COUNT
     + COL_RATIO
     + COL_INSPECT;
 const ROW_PAD: f32 = 12.0;
+/// `text-[10px]` inside a `text-xs` row: 4/3 em.
+const XS_10: f32 = 13.3333;
+/// `text-[11px]` inside a `text-xs` row: 4/3 em.
+const XS_11: f32 = 14.6667;
 /// `minmax(0,2.2fr) … minmax(0,1.6fr) …` — the fingerprint column gets 1.6fr.
 const INDEX_SHARE: f32 = 1.6 / (2.2 + 1.6);
 
@@ -41,19 +52,21 @@ pub fn view(app: &App) -> Element<'_, Message> {
         return empty_state(app);
     }
 
-    let total_height = (sorted.len() as f32 * ROW_HEIGHT + HEADER_HEIGHT).clamp(280.0, 620.0);
-    let viewport_height = (total_height - HEADER_HEIGHT).max(0.0);
+    // Reference: react-window's list is `min(620, max(280, rows * 58))`.
+    let viewport_height = (sorted.len() as f32 * ROW_HEIGHT).clamp(280.0, 620.0);
 
     let body = responsive_body(app, sorted, viewport_height);
 
     container(
         column![
             header_row(filters.sort_field, filters.sort_direction, app.window_width),
+            crate::ui::hrule(style::divider),
             body
         ]
         .spacing(0),
     )
     .width(Fill)
+    .padding(BORDER)
     .style(style::mongo_card)
     .into()
 }
@@ -98,6 +111,10 @@ fn responsive_body(
         scrollable(list)
             .on_scroll(Message::MongoScrolled)
             .height(Length::Fixed(viewport_height))
+            // Chromium's overlay scrollbar takes no layout width.
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::new().width(0.0).scroller_width(0.0),
+            ))
             .width(Fill)
             .into()
     })
@@ -110,7 +127,8 @@ fn header_row(
     direction: MongoSortDirection,
     window_width: f32,
 ) -> Element<'static, Message> {
-    let table_width = (window_width - 64.0).max(760.0);
+    // The page gutters are 16px a side and the card border 1px a side.
+    let table_width = (window_width - 34.0).max(760.0);
     let pattern_width = table_width - NUMERIC_WIDTH - ROW_PAD * 2.0;
     let index_width = (pattern_width * INDEX_SHARE).max(80.0);
     let first_width = (pattern_width - index_width).max(120.0);
@@ -124,10 +142,16 @@ fn header_row(
             sort_header("P95", MongoSortField::P95DurationMs, sort_field, direction, COL_P95, true),
             sort_header("Max", MongoSortField::MaxDurationMs, sort_field, direction, COL_MAX, true),
             sort_header("Scan Ratio", MongoSortField::ScanRatio, sort_field, direction, COL_RATIO, true),
-            container(text("Suggested Index (1-Click Copy)").size(11).font(style::SEMIBOLD).style(style::text_muted))
-                .width(Length::Fixed(index_width))
-                .padding(Padding { top: 0.0, right: 8.0, bottom: 0.0, left: 8.0 }),
-            container(text("View").size(11).font(style::SEMIBOLD).style(style::text_muted))
+            container(boxed_text(
+                "Suggested Index (1-Click Copy)",
+                11.0,
+                style::SEMIBOLD,
+                lh::TEXT_11,
+                style::text_muted,
+            ))
+            .width(Length::Fixed(index_width))
+            .padding(Padding { top: 0.0, right: 8.0, bottom: 0.0, left: 8.0 }),
+            container(boxed_text("View", 11.0, style::SEMIBOLD, lh::TEXT_11, style::text_muted))
                 .width(Length::Fixed(COL_INSPECT))
                 .align_x(Center),
         ]
@@ -136,7 +160,8 @@ fn header_row(
         .padding(Padding { top: 10.0, right: ROW_PAD, bottom: 10.0, left: ROW_PAD }),
     )
     .width(Fill)
-    .height(Length::Fixed(HEADER_HEIGHT))
+    .height(Length::Fixed(HEADER_CONTENT))
+    .align_y(Center)
     .style(style::table_header)
     .into()
 }
@@ -150,21 +175,27 @@ fn pattern_row(
 ) -> Element<'static, Message> {
     let is_copied = copied == Some(pattern.id.as_str());
     let fingerprint = text_fit::truncate_mono(&pattern.fingerprint, 11.0, first_width - 8.0);
-    let suggestion = text_fit::truncate_mono(&pattern.index_suggestion, 10.0, index_width - 28.0);
+    // Reference: `px-2` cell around a `px-2 py-1` button with a 12px icon.
+    let suggestion = text_fit::truncate_mono(&pattern.index_suggestion, 10.0, index_width - 46.0);
     let collection = text_fit::truncate_mono(&pattern.collection, 12.0, first_width - 70.0);
 
     let mut title = row![
-        container(
-            text(pattern.op.clone())
-                .size(10)
-                .font(style::BOLD),
-        )
-        .padding([2, 6])
+        container(boxed_text(
+            pattern.op.to_uppercase(),
+            10.0,
+            style::WIDER_BOLD,
+            XS_10,
+            style::text_inherit,
+        ))
+        .padding([0, 6])
         .style(style::mongo_op_badge(&pattern.op)),
-        text(collection.into_owned())
-            .size(12)
-            .font(style::SEMIBOLD)
-            .style(style::text_heading),
+        boxed_text(
+            collection.into_owned(),
+            12.0,
+            style::SEMIBOLD,
+            lh::TEXT_XS,
+            style::text_heading,
+        ),
     ]
     .spacing(6)
     .align_y(Center);
@@ -174,30 +205,31 @@ fn pattern_row(
             container(
                 row![
                     icons::icon("flame", 10.0, style::AMBER_600),
-                    text("COLLSCAN").size(10).font(style::BOLD),
+                    boxed_text("COLLSCAN", 10.0, style::BOLD, XS_10, style::text_inherit),
                 ]
                 .spacing(2)
                 .align_y(Center),
             )
-            .padding([1, 4])
+            .padding([0, 4])
             .style(style::collscan_chip),
         );
     }
 
     let index_cell: Element<'static, Message> = if pattern.index_suggestion.is_empty() {
-        text("Indexed / Covered")
-            .size(10)
-            .style(style::text_faint)
-            .into()
+        boxed_text(
+            "Indexed / Covered",
+            10.0,
+            style::REGULAR,
+            XS_10,
+            style::text_faint,
+        )
+        .into()
     } else {
         let label = suggestion.into_owned();
         let suggestion_text = pattern.index_suggestion.clone();
         button(
             row![
-                text(label)
-                    .size(10)
-                    .font(style::MONO)
-                    .style(style::text_emerald),
+                boxed_text(label, 10.0, style::MONO, XS_10, style::text_emerald),
                 space().width(Fill),
                 icons::icon(
                     if is_copied { "check" } else { "copy" },
@@ -210,7 +242,7 @@ fn pattern_row(
             .width(Fill),
         )
         .on_press(Message::MongoCopyIndex(suggestion_text))
-        .padding([4, 8])
+        .padding([5.0, 9.0])
         .width(Fill)
         .style(style::index_chip_button)
         .into()
@@ -227,10 +259,13 @@ fn pattern_row(
             container(
                 column![
                     title,
-                    text(fingerprint.into_owned())
-                        .size(11)
-                        .font(style::MONO)
-                        .style(style::text_muted),
+                    boxed_text(
+                        fingerprint.into_owned(),
+                        11.0,
+                        style::MONO,
+                        XS_11,
+                        style::text_muted,
+                    ),
                 ]
                 .spacing(2)
             )
@@ -241,16 +276,16 @@ fn pattern_row(
                 bottom: 0.0,
                 left: 0.0,
             }),
-            numeric(format_num(pattern.count), COL_COUNT, style::text_body, false),
+            numeric(format_num(pattern.count), COL_COUNT, style::text_body, style::MEDIUM),
             numeric(
                 format!("{:.1}s", pattern.total_duration_ms as f64 / 1000.0),
                 COL_TOTAL,
                 style::text_heading,
-                true,
+                style::BOLD,
             ),
-            numeric(format_ms(pattern.avg_duration_ms), COL_AVG, style::text_muted, false),
-            numeric(format_ms(pattern.p95_duration_ms as f64), COL_P95, style::text_accent, true),
-            numeric(format_ms(pattern.max_duration_ms as f64), COL_MAX, style::text_danger, true),
+            numeric(format_ms(pattern.avg_duration_ms), COL_AVG, style::text_muted, style::REGULAR),
+            numeric(format_ms(pattern.p95_duration_ms as f64), COL_P95, style::text_accent, style::SEMIBOLD),
+            numeric(format_ms(pattern.max_duration_ms as f64), COL_MAX, style::text_danger, style::SEMIBOLD),
             numeric(
                 ratio,
                 COL_RATIO,
@@ -259,16 +294,11 @@ fn pattern_row(
                 } else {
                     style::text_muted
                 },
-                false,
+                style::MEDIUM,
             ),
             container(index_cell)
                 .width(Length::Fixed(index_width))
-                .padding(Padding {
-                    top: 0.0,
-                    right: 8.0,
-                    bottom: 0.0,
-                    left: 8.0,
-                }),
+                .padding(Padding { top: 0.0, right: 8.0, bottom: 0.0, left: 8.0 }),
             container(icons::icon("external-link", 14.0, style::SLATE_400))
                 .width(Length::Fixed(COL_INSPECT))
                 .align_x(Center),
@@ -284,6 +314,7 @@ fn pattern_row(
     )
     .width(Length::Fixed(first_width + index_width + NUMERIC_WIDTH + ROW_PAD * 2.0))
     .height(Length::Fixed(ROW_HEIGHT - 1.0))
+    .align_y(Center)
     .style(move |theme| style::table_row(theme, index.is_multiple_of(2)));
 
     let example = pattern.example_query.clone();
@@ -296,21 +327,12 @@ fn numeric(
     value: String,
     width: f32,
     text_style: fn(&iced::Theme) -> iced::widget::text::Style,
-    semibold: bool,
+    font: iced::Font,
 ) -> Element<'static, Message> {
-    container(
-        text(value)
-            .size(12)
-            .font(if semibold {
-                style::SEMIBOLD
-            } else {
-                style::REGULAR
-            })
-            .style(text_style),
-    )
-    .width(Length::Fixed(width))
-    .align_x(Right)
-    .into()
+    container(boxed_text(value, 12.0, font, lh::TEXT_XS, text_style))
+        .width(Length::Fixed(width))
+        .align_x(Right)
+        .into()
 }
 
 fn sort_header(
@@ -337,7 +359,7 @@ fn sort_header(
     };
 
     let content: Element<'static, Message> = row![
-        text(label).size(11).font(style::SEMIBOLD).style(style::text_muted),
+        boxed_text(label, 11.0, style::SEMIBOLD, lh::TEXT_11, style::text_muted),
         icons::icon(icon, 12.0, color),
     ]
     .spacing(4)
@@ -361,15 +383,16 @@ fn empty_state(app: &App) -> Element<'_, Message> {
     let active_count = app.mongo.filters.active_count();
     let mut content = column![
         icons::icon("lightbulb", 32.0, style::SLATE_400),
-        text("No query patterns found")
-            .size(14)
-            .font(style::SEMIBOLD)
-            .style(style::text_body),
-        text("Try adjusting the search query, duration, or plan filters.")
-            .size(12)
-            .style(style::text_muted),
+        crate::ui::lined("No query patterns found", 14.0, style::SEMIBOLD, lh::TEXT_SM),
+        crate::ui::lined_styled(
+            "Try adjusting the search query, duration, or plan filters.",
+            12.0,
+            style::REGULAR,
+            lh::TEXT_XS,
+            style::text_muted,
+        ),
     ]
-    .spacing(6)
+    .spacing(8)
     .align_x(Center);
 
     if active_count > 0 {
@@ -377,9 +400,13 @@ fn empty_state(app: &App) -> Element<'_, Message> {
             button(
                 row![
                     icons::icon("rotate-ccw", 14.0, style::ROSE_700),
-                    text(format!("Reset all filters ({active_count})"))
-                        .size(12)
-                        .font(style::SEMIBOLD),
+                    boxed_text(
+                        format!("Reset all filters ({active_count})"),
+                        12.0,
+                        style::SEMIBOLD,
+                        lh::TEXT_XS,
+                        style::text_danger,
+                    ),
                 ]
                 .spacing(6)
                 .align_y(Center),

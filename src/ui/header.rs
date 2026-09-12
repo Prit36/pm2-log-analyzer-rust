@@ -65,6 +65,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 !is_mongo,
                 app.analysis.has_data && is_mongo,
                 accent,
+                is_dark,
                 Message::SetMode(AppMode::Pm2),
             ),
             tab(
@@ -77,6 +78,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 } else {
                     style::EMERALD_700
                 },
+                is_dark,
                 Message::SetMode(AppMode::Mongo),
             ),
         ]
@@ -87,8 +89,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
     container(
         row![
-            container(title).width(Fill),
+            container(title).width(Length::Shrink),
+            space().width(Fill),
             switcher,
+            space().width(Fill),
             row![
                 theme_button(is_dark),
                 export_button(app, is_mongo, is_dark),
@@ -96,7 +100,6 @@ pub fn view(app: &App) -> Element<'_, Message> {
             ]
             .spacing(8),
         ]
-        .spacing(16)
         .align_y(Center),
     )
     .width(Fill)
@@ -126,16 +129,22 @@ fn pm2_info(app: &App, accent: iced::Color) -> Element<'_, Message> {
         icons::icon("file-text", 20.0, accent),
         text("PM2 Log Analyzer")
             .size(16)
-            .font(style::SEMIBOLD)
+            .font(style::TIGHT_SEMIBOLD)
             .style(style::text_heading),
     ]
     .spacing(8)
     .align_y(Center);
     if let Some(badge) = date_badge {
         heading = heading.push(
-            container(text(badge).size(11).style(style::text_accent))
-                .padding([2, 8])
-                .style(style::info_pill),
+            container(crate::ui::lined_styled(
+                badge,
+                11.0,
+                style::REGULAR,
+                crate::ui::lh::TEXT_11,
+                style::text_info,
+            ))
+            .padding([2, 8])
+            .style(style::info_pill),
         );
     }
 
@@ -145,7 +154,9 @@ fn pm2_info(app: &App, accent: iced::Color) -> Element<'_, Message> {
     };
 
     iced::widget::column![
-        container(heading).height(Length::Fixed(crate::ui::lh::TEXT_BASE)),
+        container(heading)
+            .height(Length::Fixed(crate::ui::lh::TEXT_BASE))
+            .align_y(iced::Center),
         crate::ui::lined(
             subtitle,
             12.0,
@@ -172,7 +183,7 @@ fn theme_button(is_dark: bool) -> Element<'static, Message> {
         },
     ))
     .on_press(Message::ToggleTheme)
-    .padding(6)
+    .padding(7)
     .style(style::btn_secondary)
     .into()
 }
@@ -200,13 +211,19 @@ fn export_button(app: &App, is_mongo: bool, is_dark: bool) -> Element<'static, M
                     style::SLATE_700
                 }
             ),
-            text("Export").size(12).font(style::MEDIUM),
+            crate::ui::boxed_text(
+                "Export",
+                12.0,
+                style::MEDIUM,
+                crate::ui::lh::TEXT_XS,
+                style::text_button,
+            ),
         ]
         .spacing(6)
         .align_y(Center),
     )
     .on_press_maybe(enabled.then_some(message))
-    .padding([6, 12])
+    .padding([7, 13])
     .style(style::btn_secondary)
     .into()
 }
@@ -234,13 +251,19 @@ fn clear_button(app: &App, is_mongo: bool, is_dark: bool) -> Element<'static, Me
                     style::SLATE_700
                 }
             ),
-            text("Clear").size(12).font(style::MEDIUM),
+            crate::ui::boxed_text(
+                "Clear",
+                12.0,
+                style::MEDIUM,
+                crate::ui::lh::TEXT_XS,
+                style::text_button,
+            ),
         ]
         .spacing(6)
         .align_y(Center),
     )
     .on_press_maybe(enabled.then_some(message))
-    .padding([6, 12])
+    .padding([7, 13])
     .style(style::btn_secondary)
     .into()
 }
@@ -251,12 +274,28 @@ fn tab(
     active: bool,
     show_dot: bool,
     accent: iced::Color,
+    is_dark: bool,
     on_press: Message,
 ) -> Element<'static, Message> {
-    let text_color = if active { accent } else { style::SLATE_500 };
-    let mut content = row![icons::icon(icon, 14.0, text_color), text(label).size(12)]
-        .spacing(6)
-        .align_y(Center);
+    let text_color = if active {
+        accent
+    } else if is_dark {
+        style::SLATE_400
+    } else {
+        style::SLATE_500
+    };
+    let mut content = row![
+        icons::icon(icon, 14.0, text_color),
+        crate::ui::boxed_text(
+            label,
+            12.0,
+            style::SEMIBOLD,
+            crate::ui::lh::TEXT_XS,
+            style::text_tab(active, accent),
+        )
+    ]
+    .spacing(6)
+    .align_y(Center);
     if show_dot {
         content = content.push(
             container(space().width(6.0).height(6.0))

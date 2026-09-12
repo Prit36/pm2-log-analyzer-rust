@@ -15,6 +15,7 @@ use iced::{Element, Fill, Padding};
 
 use crate::app::{App, Message};
 use crate::ui::style;
+use crate::ui::boxed_text;
 use crate::utils::format::{format_bytes, format_date};
 
 /// `MongoAppView` — ingest, then KPIs/filters/one active view, then the footer.
@@ -59,22 +60,26 @@ pub fn header_info(app: &App) -> Element<'_, Message> {
 
     let mut heading = iced::widget::row![
         crate::ui::icons::icon("database", 20.0, style::EMERALD_600),
-        text("MongoDB Log Analyzer")
-            .size(16)
-            .font(style::SEMIBOLD)
-            .style(style::text_heading),
+        boxed_text(
+            "MongoDB Log Analyzer",
+            16.0,
+            style::TIGHT_SEMIBOLD,
+            crate::ui::lh::TEXT_BASE,
+            style::text_heading,
+        ),
     ]
     .spacing(8)
     .align_y(iced::Center);
 
     if let Some(badge) = date_range_badge(&dates) {
         heading = heading.push(
-            container(
-                text(badge)
-                    .size(11)
-                    .font(style::MEDIUM)
-                    .style(style::text_emerald),
-            )
+            container(boxed_text(
+                badge,
+                11.0,
+                style::MEDIUM,
+                crate::ui::lh::TEXT_11,
+                style::text_emerald,
+            ))
             .padding([2, 8])
             .style(style::emerald_pill),
         );
@@ -87,10 +92,13 @@ pub fn header_info(app: &App) -> Element<'_, Message> {
 
     iced::widget::column![
         heading,
-        text(subtitle)
-            .size(12)
-            .font(if is_mono { style::MONO } else { style::REGULAR })
-            .style(style::text_muted),
+        boxed_text(
+            subtitle,
+            12.0,
+            if is_mono { style::MONO } else { style::REGULAR },
+            crate::ui::lh::TEXT_XS,
+            style::text_muted,
+        ),
     ]
     .spacing(2)
     .into()

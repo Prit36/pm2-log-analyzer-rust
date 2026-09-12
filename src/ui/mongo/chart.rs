@@ -154,6 +154,7 @@ fn composed_chart<'a>(app: &'a App, buckets: &[MongoTimeBucket]) -> Element<'a, 
             plot,
             plot.x - 8.0,
             plot.x,
+            tick_color(is_dark),
         )
         .ticks,
         grid_color(is_dark),
@@ -180,12 +181,13 @@ fn composed_chart<'a>(app: &'a App, buckets: &[MongoTimeBucket]) -> Element<'a, 
             plot,
             plot.x - 8.0,
             plot.x,
+            tick_color(is_dark),
         ),
         plot,
     );
     emit_axis(
         &mut canvas,
-        &right_axis_with_unit(&right_ticks, plot),
+        &right_axis_with_unit(&right_ticks, plot, tick_color(is_dark)),
         plot,
     );
 
@@ -276,6 +278,7 @@ fn plans_chart<'a>(app: &'a App, buckets: &[MongoTimeBucket]) -> Element<'a, Mes
         plot,
         plot.x - 8.0,
         plot.x,
+        tick_color(is_dark),
     );
     grid_lines(&mut canvas, plot, &axis.ticks, grid_color(is_dark), false);
     emit_axis(
@@ -374,6 +377,7 @@ fn collections_chart<'a>(app: &'a App, collections: &[MongoCollectionMetric]) ->
         plot.y + plot.h + 16.0,
         plot.y + plot.h,
         "s",
+        tick_color(is_dark),
     );
     grid_lines(&mut canvas, plot, &axis.ticks, grid_color(is_dark), true);
     emit_axis(&mut canvas, &axis, plot);
@@ -579,7 +583,7 @@ fn bucket_max(buckets: &[MongoTimeBucket], get: impl Fn(&MongoTimeBucket) -> f64
 }
 
 /// Right-hand latency axis: `tickFormatter={(v) => `${v}ms`}`.
-fn right_axis_with_unit(ticks: &[f64], plot: Rect) -> crate::ui::charts::Axis {
+fn right_axis_with_unit(ticks: &[f64], plot: Rect, color: &'static str) -> crate::ui::charts::Axis {
     numeric_axis_with_unit(
         ticks,
         AxisKind::NumberPlain,
@@ -588,6 +592,7 @@ fn right_axis_with_unit(ticks: &[f64], plot: Rect) -> crate::ui::charts::Axis {
         plot.x + plot.w + 8.0,
         plot.x + plot.w,
         "ms",
+        color,
     )
 }
 
@@ -600,8 +605,10 @@ fn numeric_axis_with_unit(
     label_offset: f64,
     axis_line: f64,
     unit: &str,
+    color: &'static str,
 ) -> crate::ui::charts::Axis {
-    let mut axis = build_numeric_axis(ticks, kind, orientation, plot, label_offset, axis_line);
+    let mut axis =
+        build_numeric_axis(ticks, kind, orientation, plot, label_offset, axis_line, color);
     for tick in &mut axis.ticks {
         tick.value.push_str(unit);
     }

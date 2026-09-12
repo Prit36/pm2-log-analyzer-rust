@@ -56,9 +56,9 @@ impl MongoActiveView {
     pub const ALL: [MongoActiveView; 5] = [
         MongoActiveView::Patterns,
         MongoActiveView::SlowQueries,
+        MongoActiveView::Users,
         MongoActiveView::Charts,
         MongoActiveView::Diagnostics,
-        MongoActiveView::Users,
     ];
 
     pub fn label(self) -> &'static str {
@@ -77,6 +77,16 @@ impl MongoActiveView {
 struct PersistedMongo {
     filters: MongoFilters,
     active_view: MongoActiveView,
+}
+
+/// `MongoDiagnosticsPanel`'s local tab state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MongoDiagTab {
+    #[default]
+    Errors,
+    Connections,
+    Collections,
+    Checkpoints,
 }
 
 #[derive(Clone)]
@@ -98,6 +108,9 @@ pub struct MongoState {
     pub active_slow_query: Option<MongoSlowQuery>,
     pub active_user_detail: Option<MongoUserActivity>,
     pub active_view: MongoActiveView,
+    pub diag_tab: MongoDiagTab,
+    /// Local `MongoUserActivityPanel` search box.
+    pub user_search: String,
 }
 
 impl Default for MongoState {
@@ -120,6 +133,8 @@ impl Default for MongoState {
             active_slow_query: None,
             active_user_detail: None,
             active_view: MongoActiveView::default(),
+            diag_tab: MongoDiagTab::default(),
+            user_search: String::new(),
         }
     }
 }

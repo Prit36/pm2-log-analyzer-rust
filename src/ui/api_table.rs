@@ -1,6 +1,5 @@
 //! `ApiTable` — port of `src/components/ApiTable.tsx`.
 
-use iced::widget::text::Wrapping;
 use iced::widget::{button, column, container, mouse_area, responsive, row, scrollable, space, text};
 use iced::{Center, Element, Fill, Length, Padding, Right};
 
@@ -12,8 +11,17 @@ use crate::utils::format::{format_ms, format_num};
 use crate::utils::text_fit;
 
 const ROW_HEIGHT: f32 = 32.0;
-const HEADER_HEIGHT: f32 = 32.0;
+/// `py-2` + the 11px/16.5 "Copy TSV" line box, minus the 1px border that the
+/// caller draws separately.
+const HEADER_CONTENT: f32 = 32.5;
 const OVERSCAN: usize = 6;
+/// `text-xs` inherits Tailwind's unitless 1.3333 line-height into the row, so
+/// the 10px method badge and 11px path sit on shorter line boxes than the
+/// document-root 1.5.
+const BADGE_LINE: f32 = 13.3333;
+const PATH_LINE: f32 = 14.6667;
+const NUMERIC_LINE: f32 = 16.0;
+const HEADER_LINE: f32 = 16.5;
 /// Numeric column widths, mirroring the reference grid template.
 const COL_COUNT: f32 = 56.0;
 const COL_AVG: f32 = 58.0;
@@ -42,11 +50,12 @@ fn header_row(
 ) -> Element<'static, Message> {
     container(
         row![
-            container(
-                text("Endpoint")
-                    .size(11)
-                    .font(style::SEMIBOLD)
-                    .style(style::text_muted)
+            crate::ui::boxed_text(
+                "Endpoint",
+                11.0,
+                style::SEMIBOLD,
+                HEADER_LINE,
+                style::text_muted,
             )
             .width(Fill),
             sort_header("Count", ApiSortKey::Count, filters, COL_COUNT, is_dark, hovered),
@@ -73,7 +82,8 @@ fn header_row(
         }),
     )
     .width(Fill)
-    .height(Length::Fixed(HEADER_HEIGHT))
+    .height(Length::Fixed(HEADER_CONTENT))
+    .align_y(Center)
     .style(style::table_header)
     .into()
 }
@@ -86,10 +96,13 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let mut copy = button(
         row![
             icons::icon("copy", 12.0, if is_dark { style::SLATE_400 } else { style::SLATE_500 }),
-            text("Copy TSV")
-                .size(11)
-                .font(style::MEDIUM)
-                .style(style::text_muted),
+            crate::ui::boxed_text(
+                "Copy TSV",
+                11.0,
+                style::MEDIUM,
+                HEADER_LINE,
+                style::text_muted,
+            ),
         ]
         .spacing(4)
         .align_y(Center),
@@ -102,10 +115,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
     let title = container(
         row![
-            crate::ui::lined_styled(
+            crate::ui::boxed_text(
                 "SLOW API ENDPOINTS",
                 12.0,
-                style::SEMIBOLD,
+                style::WIDE_SEMIBOLD,
                 crate::ui::lh::TEXT_XS,
                 style::text_subheading,
             ),
@@ -121,6 +134,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
         }),
     )
     .width(Fill);
+    let title = container(title)
+        .width(Fill)
+        .height(Length::Fixed(HEADER_CONTENT));
 
     let body: Element<'_, Message> = if rows.is_empty() {        container(
             text("No matching endpoints")
@@ -141,8 +157,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
         // real pixels instead of guessing at layout. The reference grid keeps a
         // 680px floor inside `overflow-x-auto`, so the card scrolls sideways
         // instead of squeezing the columns.
-        let total_height = (rows.len() as f32 * ROW_HEIGHT + HEADER_HEIGHT).clamp(120.0, 420.0);
-        let viewport_height = (total_height - HEADER_HEIGHT).max(0.0);
+        //
+        // Reference: `Math.min(420, Math.max(120, rows.length * 32 + 36))` is
+        // the *viewport* height (react-window's List), not a content height.
+        let viewport_height = (rows.len() as f32 * ROW_HEIGHT + 36.0).clamp(120.0, 420.0);
         responsive(move |size| {
             let table_width = f64::from(size.width).max(MIN_TABLE_WIDTH) as f32;
             let (start, end) = virtualize::visible_range(
@@ -176,6 +194,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 scrollable(list)
                     .on_scroll(Message::ApiScrolled)
                     .height(Length::Fixed(viewport_height))
+                    // Chromium's overlay scrollbar takes no layout width.
+                    .direction(scrollable::Direction::Vertical(
+                        scrollable::Scrollbar::new().width(0.0).scroller_width(0.0),
+                    ))
                     .width(Fill),
             ]
             .spacing(0)
@@ -199,6 +221,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     ]
     .spacing(0))
         .width(Fill)
+        .padding(crate::ui::BORDER)
         .style(style::card)
         .into()
 }
@@ -232,10 +255,13 @@ fn api_row(
     };
     let path_button = button(
         row![
-            text(label.into_owned())
-                .size(PATH_FONT_SIZE)
-                .font(style::MONO)
-                .wrapping(Wrapping::None),
+            crate::ui::boxed_text(
+                label.into_owned(),
+                PATH_FONT_SIZE,
+                style::MONO,
+                PATH_LINE,
+                style::text_strong,
+            ),
             trailing,
         ]
         .spacing(ICON_GAP)
@@ -245,11 +271,13 @@ fn api_row(
     .padding(0)
     .style(style::path_button(is_hovered));
 
-    let badge = container(
-        text(method)
-            .size(BADGE_FONT_SIZE)
-            .font(style::BOLD),
-    )
+    let badge = container(crate::ui::boxed_text(
+        method,
+        BADGE_FONT_SIZE,
+        style::WIDE_BOLD,
+        BADGE_LINE,
+        style::text_inherit,
+    ))
     .padding([2, 6])
     .style(style::method_badge(method));
 
@@ -297,6 +325,7 @@ fn api_row(
     )
     .width(Fill)
     .height(Length::Fixed(ROW_HEIGHT - 1.0))
+    .align_y(Center)
     .style(move |theme| style::table_row(theme, index.is_multiple_of(2)))
     .into();
 
@@ -312,16 +341,17 @@ fn numeric(
     text_style: fn(&iced::Theme) -> iced::widget::text::Style,
     semibold: bool,
 ) -> Element<'static, Message> {
-    container(
-        text(value)
-            .size(12)
-            .font(if semibold {
-                style::SEMIBOLD
-            } else {
-                style::REGULAR
-            })
-            .style(text_style),
-    )
+    container(crate::ui::boxed_text(
+        value,
+        12.0,
+        if semibold {
+            style::SEMIBOLD
+        } else {
+            style::REGULAR
+        },
+        NUMERIC_LINE,
+        text_style,
+    ))
     .width(Length::Fixed(width))
     .align_x(Right)
     .into()
@@ -361,13 +391,16 @@ fn sort_header(
     let font = if active { style::BOLD } else { style::SEMIBOLD };
 
     let content: Element<'static, Message> = if show_icon {
-        row![text(label).size(11).font(font).style(text_style), icons::icon(icon, size, color)]
-            .spacing(4)
-            .align_y(Center)
-            .into()
+        row![
+            crate::ui::boxed_text(label, 11.0, font, HEADER_LINE, text_style),
+            icons::icon(icon, size, color)
+        ]
+        .spacing(4)
+        .align_y(Center)
+        .into()
     } else {
         row![
-            text(label).size(11).font(font).style(text_style),
+            crate::ui::boxed_text(label, 11.0, font, HEADER_LINE, text_style),
             // `opacity-0` still reserves the icon slot in the reference.
             space().width(size).height(size)
         ]

@@ -12,6 +12,8 @@ const outFile = path.resolve(process.argv[3] ?? "/tmp/ref.png");
 const width = Number(process.argv[4] ?? 1024);
 const height = Number(process.argv[5] ?? 768);
 const mongo = process.argv.includes("--mongo");
+const viewIndex = process.argv.indexOf("--view");
+const view = viewIndex > 0 ? process.argv[viewIndex + 1] : null;
 
 const browser = await chromium.launch();
 const page = await browser.newPage({
@@ -24,6 +26,9 @@ if (mongo) {
   await page.click("button:has-text('MongoDB Logs')");
   await page.setInputFiles("input[type=file]", logFile);
   await page.waitForSelector("text=Slow Queries", { timeout: 300000 });
+  if (view) {
+    await page.click(`button:has-text('${view}')`);
+  }
 } else {
   // Load through the hidden file input so the paste panel stays closed, which
   // matches the native preview state (no extra card in the layout).

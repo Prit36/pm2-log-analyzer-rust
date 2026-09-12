@@ -86,6 +86,7 @@ pub fn view(app: &App) -> Option<Element<'_, Message>> {
     };
     let card = container(tiles)
         .width(Fill)
+        .padding(crate::ui::BORDER)
         .style(move |_theme| iced::widget::container::Style {
             border: Border {
                 color: border,
@@ -106,7 +107,7 @@ fn tile(item: &KpiItem) -> iced::widget::Container<'static, Message> {
             crate::ui::lined_styled(
                 item.label,
                 10.0,
-                style::SEMIBOLD,
+                style::WIDE_SEMIBOLD,
                 crate::ui::lh::TEXT_10,
                 style::text_muted,
             ),

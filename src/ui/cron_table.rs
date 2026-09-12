@@ -379,6 +379,7 @@ fn cron_row(index: usize, row_data: &CronAggregated, name_width: f32) -> Element
     )
     .width(Fill)
     .height(Length::Fixed(ROW_HEIGHT - 1.0))
+    .align_y(Center)
     .style(move |theme| style::table_row(theme, index.is_multiple_of(2)))
     .into()
 }

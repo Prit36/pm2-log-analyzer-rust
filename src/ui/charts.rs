@@ -58,6 +58,7 @@ pub(crate) struct Axis {
     label_offset: f64,
     font_family: Option<&'static str>,
     font_size: f64,
+    color: &'static str,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -784,19 +785,35 @@ pub(crate) fn emit_axis(svg: &mut Svg, axis: &Axis, plot: Rect) {
         if !tick.show {
             continue;
         }
-        let (tx, ty, anchor, dy) = match axis.orientation {
-            Orientation::Bottom => (tick.coord, axis.label_offset, "middle", "0.71em"),
-            Orientation::Left => (axis.label_offset, tick.coord, "end", "0.355em"),
-            Orientation::Right => (axis.label_offset, tick.coord, "start", "0.355em"),
+        let (tx, ty, anchor, dy_em) = match axis.orientation {
+            Orientation::Bottom => (tick.coord, axis.label_offset, "middle", 0.71),
+            Orientation::Left => (axis.label_offset, tick.coord, "end", 0.355),
+            Orientation::Right => (axis.label_offset, tick.coord, "start", 0.355),
         };
-        let font_family = match axis.font_family {
-            Some(family) => format!(" font-family=\"{family}\""),
-            None => String::new(),
+        // `resvg` cannot see the page webfont, so labels are emitted as the
+        // bundled face's outlines instead of `<text>` elements.
+        let face_kind = if axis.font_family.is_some() {
+            crate::utils::text_path::FaceKind::MonoRegular
+        } else {
+            crate::utils::text_path::FaceKind::SansRegular
         };
+        let anchor_kind = match anchor {
+            "middle" => crate::utils::text_path::Anchor::Middle,
+            "end" => crate::utils::text_path::Anchor::End,
+            _ => crate::utils::text_path::Anchor::Start,
+        };
+        let baseline = ty + dy_em * axis.font_size;
+        let d = crate::utils::text_path::path_data(
+            &tick.value,
+            face_kind,
+            axis.font_size,
+            tx,
+            baseline,
+            anchor_kind,
+        );
         svg.out.push_str(&format!(
-            "<g class=\"recharts-layer recharts-cartesian-axis-tick-label\"><text width=\"{}\" orientation=\"{orientation}\" height=\"{}\" stroke=\"none\" font-size=\"{}\"{font_family} x=\"{}\" y=\"{}\" class=\"recharts-text recharts-cartesian-axis-tick-value\" text-anchor=\"{anchor}\" fill=\"#64748b\"><tspan x=\"{}\" dy=\"{dy}\">{}</tspan></text></g>",
-            trim_num(axis_w), trim_num(axis_h), trim_num(axis.font_size),
-            trim_num(tx), trim_num(ty), trim_num(tx), tick.value
+            "<g class=\"recharts-layer recharts-cartesian-axis-tick-label\"><path d=\"{d}\" fill=\"{}\" stroke=\"none\" class=\"recharts-text recharts-cartesian-axis-tick-value\"></path></g>",
+            axis.color
         ));
     }
     svg.out.push_str("</g>");
@@ -819,11 +836,11 @@ fn render_chart(
     hourly: &[HourlyBucket],
     daily: &[DaySummary],
     rows: &[AggregatedEndpoint],
-    grid_color: &str,
-    tick_color: &str,
-    category_tick: &str,
-    bar_color: &str,
-    error_color: &str,
+    grid_color: &'static str,
+    tick_color: &'static str,
+    category_tick: &'static str,
+    bar_color: &'static str,
+    error_color: &'static str,
 ) -> String {
     let multi_day = daily.len() > 1;
     let mut svg = Svg::new(width, height);
@@ -831,7 +848,7 @@ fn render_chart(
     match mode {
         ChartMode::DailyTrend if multi_day => {
             let n = daily.len();
-            let margins = (10.0, 16.0, 0.0, 4.0);
+            let margins = (10.0, 16.0, 4.0, 0.0);
             let offset = (
                 margins.0,
                 margins.1 + Y_AXIS_WIDTH,
@@ -861,6 +878,7 @@ fn render_chart(
                 plot,
                 plot.x - 8.0,
                 plot.x,
+                tick_color,
             );
             let y_right = build_numeric_axis(
                 &right_ticks,
@@ -869,6 +887,7 @@ fn render_chart(
                 plot,
                 plot.x + plot.w + 8.0,
                 plot.x + plot.w,
+                tick_color,
             );
 
             let mut x_ticks: Vec<Tick> = (0..n)
@@ -964,7 +983,7 @@ fn render_chart(
         }
         ChartMode::TimeOfDay | ChartMode::DailyTrend => {
             let n = hourly.len();
-            let margins = (10.0, 16.0, 0.0, 4.0);
+            let margins = (10.0, 16.0, 4.0, 0.0);
             let offset = (
                 margins.0,
                 margins.1,
@@ -990,6 +1009,7 @@ fn render_chart(
                 plot,
                 plot.x - 8.0,
                 plot.x,
+                tick_color,
             );
 
             let x_ticks: Vec<Tick> = (0..n)
@@ -1054,7 +1074,7 @@ fn render_chart(
         }
         ChartMode::Throughput => {
             let n = hourly.len();
-            let margins = (10.0, 16.0, 0.0, 4.0);
+            let margins = (10.0, 16.0, 4.0, 0.0);
             let offset = (
                 margins.0,
                 margins.1 + Y_AXIS_WIDTH,
@@ -1081,6 +1101,7 @@ fn render_chart(
                 plot,
                 plot.x - 8.0,
                 plot.x,
+                tick_color,
             );
             let y_right = build_numeric_axis(
                 &right_ticks,
@@ -1089,6 +1110,7 @@ fn render_chart(
                 plot,
                 plot.x + plot.w + 8.0,
                 plot.x + plot.w,
+                tick_color,
             );
 
             let x_ticks: Vec<Tick> = (0..n)
@@ -1158,7 +1180,7 @@ fn render_chart(
         ChartMode::Distribution => {
             let buckets = distribution_buckets(rows);
             let n = buckets.len();
-            let margins = (10.0, 16.0, 0.0, 4.0);
+            let margins = (10.0, 16.0, 4.0, 0.0);
             let offset = (
                 margins.0,
                 margins.1,
@@ -1181,6 +1203,7 @@ fn render_chart(
                 plot,
                 plot.x - 8.0,
                 plot.x,
+                tick_color,
             );
 
             let mut x_ticks: Vec<Tick> = buckets
@@ -1337,6 +1360,7 @@ fn render_chart(
                 label_offset: plot.y + plot.h + 8.0,
                 font_family: None,
                 font_size: FONT_SIZE,
+                color: tick_color,
             };
             emit_axis(&mut svg, &x_axis, plot);
 
@@ -1348,9 +1372,9 @@ fn render_chart(
                 label_offset: plot.x - 8.0,
                 font_family: Some("IBM Plex Mono, monospace"),
                 font_size: 9.0,
+                color: category_tick,
             };
             emit_axis(&mut svg, &y_axis, plot);
-            let _ = category_tick;
         }
     }
 
@@ -1371,6 +1395,7 @@ pub(crate) fn build_numeric_axis(
     plot: Rect,
     label_offset: f64,
     axis_line: f64,
+    color: &'static str,
 ) -> Axis {
     let domain = tick_values.last().copied().unwrap_or(0.0);
     let ticks: Vec<Tick> = tick_values
@@ -1397,6 +1422,7 @@ pub(crate) fn build_numeric_axis(
         label_offset,
         font_family: None,
         font_size: FONT_SIZE,
+        color,
     }
 }
 
@@ -1406,7 +1432,7 @@ pub(crate) fn x_axis(
     axis_line: f64,
     w: f64,
     _end: f64,
-    _tick_color: &str,
+    tick_color: &'static str,
 ) -> Axis {
     Axis {
         orientation: Orientation::Bottom,
@@ -1423,6 +1449,7 @@ pub(crate) fn x_axis(
         label_offset: axis_line + 8.0,
         font_family: None,
         font_size: FONT_SIZE,
+        color: tick_color,
     }
 }
 
@@ -1530,7 +1557,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
     let mut heading = row![text("API VISUAL ANALYTICS")
         .size(12)
-        .font(style::SEMIBOLD)
+        .font(style::WIDE_SEMIBOLD)
         .style(style::text_body)];
     if app.analysis.filters.date_filter != "all" {
         heading = heading.push(
@@ -1547,27 +1574,20 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let layout_button = button(
         row![
             icons::icon(if wide { "columns2" } else { "rows2" }, 12.0, muted),
-            text(if wide { "Split View" } else { "Wide View" }).size(11),
+            crate::ui::boxed_text(
+                if wide { "Split View" } else { "Wide View" },
+                11.0,
+                style::REGULAR,
+                crate::ui::lh::TEXT_11,
+                style::text_muted,
+            ),
         ]
         .spacing(4)
         .align_y(Center),
     )
     .on_press(Message::ToggleChartLayout)
-    .padding([4, 8])
+    .padding([3, 9])
     .style(style::btn_secondary);
-
-    let header = container(
-        row![heading, space().width(Fill), layout_button]
-            .spacing(8)
-            .align_y(Center),
-    )
-    .width(Fill)
-    .padding(Padding {
-        top: 10.0,
-        right: 14.0,
-        bottom: 10.0,
-        left: 14.0,
-    });
 
     let mut tabs = row![].spacing(4).width(Fill);
     if multi_day {
@@ -1582,6 +1602,26 @@ pub fn view(app: &App) -> Element<'_, Message> {
         tabs = tabs.push(tab(app, mode, multi_day));
     }
 
+    let header = container(
+        column![
+            row![heading, space().width(Fill), layout_button]
+                .spacing(8)
+                .align_y(Center),
+            // The reference tab strip is flex-1 with `whitespace-nowrap`, so the
+            // labels keep their natural width and the strip clips at the card.
+            container(container(tabs).padding(2).style(style::segmented).clip(true),)
+                .width(Fill),
+        ]
+        .spacing(8),
+    )
+    .width(Fill)
+    .padding(Padding {
+        top: 10.0,
+        right: 14.0,
+        bottom: 10.0,
+        left: 14.0,
+    });
+
     let plot: Element<'_, Message> = match &app.chart {
         Some(handle) => {
             let chart: Element<'_, Message> = svg(handle.clone())
@@ -1589,11 +1629,22 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 .height(Length::Fixed(svg_height as f32))
                 .content_fit(iced::ContentFit::Fill)
                 .into();
-            column![
-                stack![chart, hover_layer(app, svg_width, svg_height)],
-                legend(app, is_dark),
+            // Recharts renders the legend as HTML inside the chart host; it
+            // overlays the empty strip at the bottom of the 316px SVG.
+            stack![
+                chart,
+                hover_layer(app, svg_width, svg_height),
+                container(legend(app, is_dark))
+                    .width(Fill)
+                    .height(Fill)
+                    .align_y(iced::Bottom)
+                    .padding(Padding {
+                        top: 0.0,
+                        right: 0.0,
+                        bottom: 4.0,
+                        left: 0.0,
+                    }),
             ]
-            .spacing(4)
             .into()
         }
         None => container(
@@ -1615,34 +1666,22 @@ pub fn view(app: &App) -> Element<'_, Message> {
     container(
         column![
             header,
-            // The reference tab strip is flex-1 with `whitespace-nowrap`, so the
-            // labels keep their natural width and the strip clips at the card.
-            container(
-                container(tabs)
-                    .padding(2)
-                    .style(style::segmented)
-                    .clip(true),
-            )
-            .padding(Padding {
-                top: 0.0,
-                right: 14.0,
-                bottom: 10.0,
-                left: 14.0,
-            }),
+            crate::ui::hrule(style::divider),
             container(plot)
                 .width(Fill)
                 .height(Length::Fixed(host_height as f32))
-                .center_x(Fill)
                 .padding(Padding {
-                    top: 0.0,
+                    top: 12.0,
                     right: 12.0,
                     bottom: 12.0,
                     left: 12.0,
                 }),
         ]
-        .spacing(0),
+        .spacing(0)
+        .width(Fill),
     )
     .width(Fill)
+    .padding(crate::ui::BORDER)
     .style(style::card)
     .into()
 }
@@ -1664,10 +1703,13 @@ fn tab(app: &App, mode: ChartMode, multi_day: bool) -> Element<'_, Message> {
     button(
         row![
             icons::icon(mode.icon(), 14.0, color),
-            text(mode.label(multi_day))
-                .size(12)
-                .font(style::MEDIUM)
-                .wrapping(iced::widget::text::Wrapping::None),
+            crate::ui::boxed_text(
+                mode.label(multi_day),
+                12.0,
+                style::MEDIUM,
+                crate::ui::lh::TEXT_XS,
+                style::text_chart_tab(active),
+            ),
         ]
         .spacing(6)
         .align_y(Center),
@@ -1877,19 +1919,35 @@ fn legend(app: &App, is_dark: bool) -> Element<'_, Message> {
         let color = style::from_hex(color);
         items = items.push(
             row![
-                container(space().width(8.0).height(8.0))
-                    .width(Length::Fixed(8.0))
-                    .height(Length::Fixed(8.0))
+                // Recharts' default `iconSize` is 14 for every `iconType`.
+                container(space().width(14.0).height(14.0))
+                    .width(Length::Fixed(14.0))
+                    .height(Length::Fixed(14.0))
                     .style(style::dot(color)),
-                text(name).size(11).style(move |_theme| {
-                    iced::widget::text::Style {
-                        color: Some(color),
-                    }
-                }),
+                crate::ui::boxed_text(
+                    name,
+                    11.0,
+                    style::REGULAR,
+                    crate::ui::lh::TEXT_11,
+                    move |_theme| iced::widget::text::Style { color: Some(color) },
+                ),
             ]
             .spacing(4)
             .align_y(Center),
         );
     }
-    container(items).width(Fill).center_x(Fill).into()
+    // Recharts' legend items keep a trailing `margin-right: 10px`; iced's row
+    // layout does not reserve spacing after the final child, so the equivalent
+    // trailing gap is folded into this spacer.
+    items = items.push(space().width(16.0));
+    container(items)
+        .width(Fill)
+        .center_x(Fill)
+        .padding(Padding {
+            top: 0.0,
+            right: 8.0,
+            bottom: 0.0,
+            left: 8.0,
+        })
+        .into()
 }

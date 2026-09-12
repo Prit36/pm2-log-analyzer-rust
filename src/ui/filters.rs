@@ -13,9 +13,19 @@ use crate::utils::format::format_date;
 
 const FIELD_PADDING: Padding = Padding {
     top: 7.0,
-    right: 8.0,
+    right: 9.0,
     bottom: 7.0,
-    left: 8.0,
+    left: 9.0,
+};
+
+/// CSS selects resolve `line-height: normal` to 18px at 12px, making them one
+/// pixel taller than the text inputs; iced centres its own line box in the
+/// picker, so 7.5/7.5 keeps the 31px outer height and glyph centre.
+const PICKER_PADDING: Padding = Padding {
+    top: 7.5,
+    right: 9.0,
+    bottom: 7.5,
+    left: 9.0,
 };
 
 impl fmt::Display for NormalizeMode {
@@ -108,7 +118,8 @@ pub fn view(app: &App) -> Option<Element<'_, Message>> {
         Some(filters.normalize_mode),
         Message::NormalizeChanged,
     )
-    .padding(FIELD_PADDING)
+    .width(Length::Fixed(106.0))
+    .padding(PICKER_PADDING)
     .text_size(12)
     .text_line_height(iced::Pixels(crate::ui::lh::TEXT_XS))
     .style(style::picker);
@@ -117,7 +128,8 @@ pub fn view(app: &App) -> Option<Element<'_, Message>> {
         Some(filters.status_family),
         Message::StatusChanged,
     )
-    .padding(FIELD_PADDING)
+    .width(Length::Fixed(58.0))
+    .padding(PICKER_PADDING)
     .text_size(12)
     .text_line_height(iced::Pixels(crate::ui::lh::TEXT_XS))
     .style(style::picker);
@@ -129,7 +141,8 @@ pub fn view(app: &App) -> Option<Element<'_, Message>> {
         .width(Length::Fixed(80.0))
         .style(style::field);
     let sort = pick_list(SORT_OPTIONS, Some(filters.sort_key), Message::ApiSortKeyChanged)
-        .padding(FIELD_PADDING)
+        .width(Length::Fixed(87.0))
+        .padding(PICKER_PADDING)
         .text_size(12)
         .text_line_height(iced::Pixels(crate::ui::lh::TEXT_XS))
         .style(style::picker);
@@ -150,18 +163,14 @@ pub fn view(app: &App) -> Option<Element<'_, Message>> {
         field("MIN MS", min_ms.into(), Length::Shrink),
         field("SORT", sort.into(), Length::Shrink),
         field("TOP N", top_n.into(), Length::Shrink),
-        container(reset).padding(iced::Padding {
-            top: 0.0,
-            right: 0.0,
-            bottom: 1.0,
-            left: 0.0,
-        }),
+        container(reset),
     ]
     .spacing(12)
     .align_y(iced::Bottom)
     .width(Fill);
 
-    let mut content = column![controls].spacing(12).width(Fill);
+    // Reference: `mt-2.5` (10px) between the main row and the secondary chips.
+    let mut content = column![controls].spacing(10).width(Fill);
 
     if dates.len() > 1 || !methods.is_empty() {
         let mut meta = row![].spacing(12).align_y(Center);
@@ -169,17 +178,23 @@ pub fn view(app: &App) -> Option<Element<'_, Message>> {
         if dates.len() > 1 {
             meta = meta.push(
                 row![
-                    crate::ui::lined_styled(
+                    container(crate::ui::lined_styled(
                         "DAY",
                         10.0,
-                        style::SEMIBOLD,
+                        style::WIDE_SEMIBOLD,
                         crate::ui::lh::TEXT_10,
                         style::text_muted,
-                    ),
+                    ))
+                    .padding(Padding {
+                        top: 0.0,
+                        right: 4.0,
+                        bottom: 0.0,
+                        left: 0.0,
+                    }),
                     chip(
                         format!("All Days ({})", dates.len()),
                         filters.date_filter == "all",
-                        style::MEDIUM,
+                        style::WIDE_MEDIUM,
                         Message::DateFilterChanged("all".to_string()),
                     ),
                 ]
@@ -190,7 +205,7 @@ pub fn view(app: &App) -> Option<Element<'_, Message>> {
                 meta = meta.push(chip(
                     format_date(Some(date)),
                     filters.date_filter == *date,
-                    style::MONO,
+                    style::MONO_WIDE,
                     Message::DateFilterChanged(date.clone()),
                 ));
             }
@@ -207,17 +222,23 @@ pub fn view(app: &App) -> Option<Element<'_, Message>> {
 
         if !methods.is_empty() {
             let mut method_row = row![
-                crate::ui::lined_styled(
+                container(crate::ui::lined_styled(
                     "METHODS",
                     10.0,
-                    style::SEMIBOLD,
+                    style::WIDE_SEMIBOLD,
                     crate::ui::lh::TEXT_10,
                     style::text_muted,
-                ),
+                ))
+                .padding(Padding {
+                    top: 0.0,
+                    right: 4.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                }),
                 chip(
-                    "All".to_string(),
+                    "ALL".to_string(),
                     all_selected,
-                    style::BOLD,
+                    style::WIDE_BOLD,
                     Message::MethodChipToggled(None)
                 ),
             ]
@@ -227,7 +248,7 @@ pub fn view(app: &App) -> Option<Element<'_, Message>> {
                 method_row = method_row.push(chip(
                     method.clone(),
                     all_selected || filters.methods.iter().any(|m| m == method),
-                    style::BOLD,
+                    style::WIDE_BOLD,
                     Message::MethodChipToggled(Some(method.clone())),
                 ));
             }
@@ -249,10 +270,10 @@ pub fn view(app: &App) -> Option<Element<'_, Message>> {
         container(content)
             .width(Fill)
             .padding(Padding {
-                top: 12.0,
-                right: 12.0,
-                bottom: 12.0,
-                left: 12.0,
+                top: 12.0 + crate::ui::BORDER,
+                right: 12.0 + crate::ui::BORDER,
+                bottom: 12.0 + crate::ui::BORDER,
+                left: 12.0 + crate::ui::BORDER,
             })
             .style(style::card)
             .into(),
@@ -268,7 +289,7 @@ fn field<'a>(
         crate::ui::lined_styled(
             label,
             10.0,
-            style::SEMIBOLD,
+            style::WIDE_SEMIBOLD,
             crate::ui::lh::TEXT_10,
             style::text_muted,
         ),
@@ -279,29 +300,47 @@ fn field<'a>(
 }
 
 fn reset_button(active_count: usize) -> Element<'static, Message> {
+    let idle_icon = iced::Color::from_rgba8(0x94, 0xa3, 0xb8, 0.4);
     let mut content = row![icons::icon(
         "rotate-ccw",
         12.0,
         if active_count > 0 {
             style::ROSE_700
         } else {
-            style::SLATE_400
+            idle_icon
         }
     )]
     .spacing(6)
     .align_y(Center);
-    content = content.push(text("Reset all filters").size(12).font(style::SEMIBOLD));
+    content = content.push(crate::ui::boxed_text(
+        "Reset all filters",
+        12.0,
+        style::SEMIBOLD,
+        crate::ui::lh::TEXT_XS,
+        if active_count > 0 {
+            style::text_reset_active
+        } else {
+            style::text_reset_idle
+        },
+    ));
     if active_count > 0 {
         content = content.push(
-            container(text(active_count.to_string()).size(10).font(style::BOLD))
-                .padding([1, 6])
-                .style(style::reset_count),
+            container(crate::ui::boxed_text(
+                active_count.to_string(),
+                10.0,
+                style::BOLD,
+                crate::ui::lh::TEXT_10,
+                style::text_reset_count,
+            ))
+            .padding([1, 6])
+            .style(style::reset_count),
         );
     }
+    content = content.padding([6, 10]);
 
     button(content)
         .on_press_maybe((active_count > 0).then_some(Message::ResetFilters))
-        .padding([6, 10])
+        .padding(1)
         .style(style::reset_chip(active_count > 0))
         .into()
 }

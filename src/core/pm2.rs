@@ -71,7 +71,7 @@ impl std::fmt::Display for ParseError {
 // ── Source bytes ────────────────────────────────────────────────────────────
 
 /// One loaded log source: a file on disk or in-memory bytes (paste / archive entry).
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum LoadedSource {
     Path(PathBuf),
     Memory { name: String, bytes: Arc<Vec<u8>> },
