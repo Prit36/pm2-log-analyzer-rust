@@ -2,15 +2,11 @@
 //!
 //! Recharts is reproduced from the observed reference output: the same plot
 //! rects, tick algorithm (`getNiceTickValues` adaptive), monotone cubic curves,
-//! bar sizing and legend markup.
-
-use dioxus::prelude::*;
+//! bar sizing and legend markup. The SVG document is generated here and shown
+//! through iced's `svg` widget, so the plot keeps the exact Recharts geometry.
 
 use crate::core::models::{AggregatedEndpoint, DaySummary, HourlyBucket};
-use crate::store::{toggle_chart_layout, use_analysis_store, ChartLayout};
-use crate::ui::icons::Icon;
-use crate::utils::cn::cn;
-use crate::utils::format::{format_date, format_ms, format_num_i64};
+use crate::utils::format::{format_date, format_ms, format_num, format_num_i64};
 
 // Palette (src/utils/palette.ts)
 const GRID_LIGHT: &str = "#f1f5f9";
@@ -28,10 +24,52 @@ const ERROR_RED: &str = "#ef4444";
 const Y_AXIS_WIDTH: f64 = 60.0;
 const X_AXIS_HEIGHT: f64 = 30.0;
 const LEGEND_HEIGHT: f64 = 20.5;
-const FONT_SIZE: f64 = 10.0;
+pub const FONT_SIZE: f64 = 10.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ChartMode {
+pub(crate) enum AxisKind {
+    /// `type="number"` with the reference `formatMs` tick formatter.
+    NumberMs,
+    /// `type="number"` with `formatNum`.
+    NumberCount,
+    /// `type="number"` with the default Recharts formatter (plain numbers).
+    NumberPlain,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Rect {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) w: f64,
+    pub(crate) h: f64,
+}
+
+pub(crate) struct Tick {
+    pub(crate) value: String,
+    pub(crate) coord: f64,
+    pub(crate) show: bool,
+}
+
+pub(crate) struct Axis {
+    pub(crate) orientation: Orientation,
+    pub(crate) len: f64,
+    pub(crate) ticks: Vec<Tick>,
+    pub(crate) axis_line: f64,
+    label_offset: f64,
+    font_family: Option<&'static str>,
+    font_size: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Orientation {
+    Bottom,
+    Left,
+    Right,
+}
+
+/// Chart modes available in the tab bar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChartMode {
     DailyTrend,
     TimeOfDay,
     Throughput,
@@ -39,78 +77,116 @@ enum ChartMode {
     TopP95,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum AxisKind {
-    /// `type="number"` with the reference `formatMs` tick formatter.
-    NumberMs,
-    /// `type="number"` with `formatNum`.
-    NumberCount,
+impl ChartMode {
+    /// Tab label, shortened on multi-day data sets like the reference.
+    pub fn label(self, multi_day: bool) -> &'static str {
+        match self {
+            ChartMode::DailyTrend => "Trend",
+            ChartMode::TimeOfDay => {
+                if multi_day {
+                    "Latency"
+                } else {
+                    "Time vs Latency"
+                }
+            }
+            ChartMode::Throughput => {
+                if multi_day {
+                    "Volume"
+                } else {
+                    "Hourly Volume"
+                }
+            }
+            ChartMode::Distribution => {
+                if multi_day {
+                    "Dist"
+                } else {
+                    "Distribution"
+                }
+            }
+            ChartMode::TopP95 => {
+                if multi_day {
+                    "Slowest"
+                } else {
+                    "Top Slowest"
+                }
+            }
+        }
+    }
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            ChartMode::DailyTrend => "calendar-days",
+            ChartMode::TimeOfDay => "clock",
+            ChartMode::Throughput => "bar-chart3",
+            ChartMode::Distribution => "activity",
+            ChartMode::TopP95 => "flame",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            ChartMode::DailyTrend => "Daily Trend (Requests, Latency, Errors across all days)",
+            ChartMode::TimeOfDay => "Time of Day vs Latency Trend",
+            ChartMode::Throughput => "Hourly Request Volume & Error Rate",
+            ChartMode::Distribution => "Latency Distribution Buckets",
+            ChartMode::TopP95 => "Top p95 Slowest Endpoints",
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Rect {
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
+const BAR_BLUE_DARK: &str = "#60a5fa";
+const ERROR_RED_DARK: &str = "#f87171";
+
+/// Recharts legend entries for a mode, mirroring the reference legend markup.
+pub fn legend_items(mode: ChartMode, is_dark: bool) -> Vec<(&'static str, &'static str)> {
+    let bar = if is_dark { BAR_BLUE_DARK } else { BAR_BLUE };
+    let error = if is_dark { ERROR_RED_DARK } else { ERROR_RED };
+    match mode {
+        ChartMode::DailyTrend => vec![
+            ("Avg Latency", AVG),
+            ("Errors", error),
+            ("P95 Latency", P99),
+            ("Requests", bar),
+        ],
+        ChartMode::TimeOfDay => vec![
+            ("Avg Latency", AVG),
+            ("P95 Latency", P95),
+            ("P99 Latency", P99),
+        ],
+        ChartMode::Throughput => vec![("Errors (4xx/5xx)", error), ("Total Requests", bar)],
+        ChartMode::Distribution | ChartMode::TopP95 => Vec::new(),
+    }
 }
 
-struct Tick {
-    value: String,
-    coord: f64,
-    show: bool,
-}
-
-struct Axis {
-    orientation: Orientation,
-    len: f64,
-    ticks: Vec<Tick>,
-    axis_line: f64,
-    label_offset: f64,
-    font_family: Option<&'static str>,
-    font_size: f64,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Orientation {
-    Bottom,
-    Left,
-    Right,
-}
-
-#[component]
-pub fn LatencyChart(rows: Vec<AggregatedEndpoint>) -> Element {
-    let store = use_analysis_store();
-    let result = store.result();
-    let hourly: Vec<HourlyBucket> = result
-        .as_ref()
-        .map(|r| r.hourly_stats.clone())
-        .unwrap_or_default();
-    let daily: Vec<DaySummary> = result
-        .as_ref()
-        .map(|r| r.daily_stats.clone())
-        .unwrap_or_default();
-    let is_dark = store.is_dark();
-    let date_filter = store.filters().date_filter;
-    let layout = store.chart_layout();
-    let mut mode = use_signal(|| ChartMode::TimeOfDay);
-
-    let has_data = !rows.is_empty() || hourly.iter().any(|h| h.count > 0);
-
-    // Chart host geometry (mirrors the ResponsiveContainer inside the layout).
-    let window_w = store.window_width();
-    let content_w = window_w.min(1280.0) - 32.0;
-    let is_lg = window_w >= 1024.0;
-    let section_w = if layout == ChartLayout::Wide || !is_lg {
+/// Plot geometry of the chart host for a window width and layout, mirroring the
+/// reference `ResponsiveContainer` measurements (whole-pixel rounding included).
+///
+/// Returns `(svg_width, svg_height, host_height)`.
+pub fn chart_size(window_width: f64, wide: bool) -> (f64, f64, f64) {
+    let content_w = window_width.min(1280.0) - 32.0;
+    let is_lg = window_width >= 1024.0;
+    let section_w = if wide || !is_lg {
         content_w
     } else {
         (content_w - 64.0) * 2.0 / 5.0 + 16.0
     };
-    // Recharts' ResponsiveContainer rounds the measured size to whole pixels.
     let svg_w = (section_w - 2.0 - 24.0).max(50.0).round();
-    let chart_h: f64 = if layout == ChartLayout::Wide { 400.0 } else { 340.0 };
-    let svg_h = (chart_h - 24.0).max(50.0).round();
+    let host_h: f64 = if wide { 400.0 } else { 340.0 };
+    let svg_h = (host_h - 24.0).max(50.0).round();
+    (svg_w, svg_h, host_h)
+}
 
+/// Renders the Recharts-parity SVG document for the given mode and geometry.
+#[allow(clippy::too_many_arguments)]
+pub fn render_svg(
+    mode: ChartMode,
+    width: f64,
+    height: f64,
+    hourly: &[HourlyBucket],
+    daily: &[DaySummary],
+    rows: &[AggregatedEndpoint],
+    is_dark: bool,
+) -> String {
     let grid_color = if is_dark { GRID_DARK } else { GRID_LIGHT };
     let tick_color = if is_dark { TICK_DARK } else { TICK_LIGHT };
     let category_tick = if is_dark {
@@ -118,214 +194,21 @@ pub fn LatencyChart(rows: Vec<AggregatedEndpoint>) -> Element {
     } else {
         CATEGORY_TICK_LIGHT
     };
-    let bar_color = if is_dark { "#60a5fa" } else { BAR_BLUE };
-    let error_color = if is_dark { "#f87171" } else { ERROR_RED };
-
-    let multi_day = daily.len() > 1;
-    let svg = if has_data {
-        Some(render_chart(
-            mode(),
-            svg_w,
-            svg_h,
-            &hourly,
-            &daily,
-            &rows,
-            grid_color,
-            tick_color,
-            category_tick,
-            bar_color,
-            error_color,
-        ))
-    } else {
-        None
-    };
-    let legend_width = svg_w - 16.0;
-    let legend = if has_data {
-        match mode() {
-            ChartMode::DailyTrend => Some(legend_html(
-                &[
-                    ("Avg Latency", AVG),
-                    ("Errors", error_color),
-                    ("P95 Latency", P99),
-                    ("Requests", bar_color),
-                ],
-                legend_width,
-                tick_color,
-            )),
-            ChartMode::TimeOfDay => Some(legend_html(
-                &[("Avg Latency", AVG), ("P95 Latency", P95), ("P99 Latency", P99)],
-                legend_width,
-                tick_color,
-            )),
-            ChartMode::Throughput => Some(legend_html(
-                &[("Errors (4xx/5xx)", error_color), ("Total Requests", bar_color)],
-                legend_width,
-                tick_color,
-            )),
-            _ => None,
-        }
-    } else {
-        None
-    };
-
-    rsx! {
-        section { class: "flex flex-col rounded border border-slate-200 bg-white shadow-xs dark:border-slate-800/80 dark:bg-slate-900/80 dark:shadow-md dark:shadow-black/20",
-            div { class: "flex flex-col gap-2 border-b border-slate-200 px-3.5 py-2.5 dark:border-slate-800",
-                div { class: "flex items-center justify-between gap-2",
-                    div { class: "flex items-center gap-2",
-                        h2 { class: "text-xs font-semibold uppercase tracking-wide text-slate-700 dark:text-slate-300",
-                            "API Visual Analytics"
-                        }
-                        if date_filter != "all" {
-                            span { class: "inline-flex items-center rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-semibold text-blue-700 dark:bg-blue-950/60 dark:text-blue-300",
-                                "{format_date(Some(&date_filter))}"
-                            }
-                        }
-                    }
-                    button {
-                        r#type: "button",
-                        onclick: move |_| toggle_chart_layout(store),
-                        class: "inline-flex items-center gap-1 rounded border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-600 hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-300 dark:hover:bg-slate-800 cursor-pointer",
-                        title: if layout == ChartLayout::Wide { "Switch to Split Side-by-Side View" } else { "Expand Chart to Full Width View" },
-                        if layout == ChartLayout::Wide {
-                            Icon { name: "columns2", class: "h-3 w-3" }
-                            span { "Split View" }
-                        } else {
-                            Icon { name: "rows", class: "h-3 w-3" }
-                            span { "Wide View" }
-                        }
-                    }
-                }
-                div { class: "flex w-full items-center gap-1 rounded bg-slate-100 p-0.5 text-xs dark:bg-slate-950",
-                    if multi_day {
-                        ChartTab {
-                            active: mode() == ChartMode::DailyTrend,
-                            icon: "calendar-days",
-                            label: "Trend",
-                            title: "Daily Trend (Requests, Latency, Errors across all days)",
-                            onclick: move |_| mode.set(ChartMode::DailyTrend),
-                        }
-                    }
-                    ChartTab {
-                        active: mode() == ChartMode::TimeOfDay,
-                        icon: "clock",
-                        label: if multi_day { "Latency" } else { "Time vs Latency" },
-                        title: "Time of Day vs Latency Trend",
-                        onclick: move |_| mode.set(ChartMode::TimeOfDay),
-                    }
-                    ChartTab {
-                        active: mode() == ChartMode::Throughput,
-                        icon: "bar-chart3",
-                        label: if multi_day { "Volume" } else { "Hourly Volume" },
-                        title: "Hourly Request Volume & Error Rate",
-                        onclick: move |_| mode.set(ChartMode::Throughput),
-                    }
-                    ChartTab {
-                        active: mode() == ChartMode::Distribution,
-                        icon: "activity",
-                        label: if multi_day { "Dist" } else { "Distribution" },
-                        title: "Latency Distribution Buckets",
-                        onclick: move |_| mode.set(ChartMode::Distribution),
-                    }
-                    ChartTab {
-                        active: mode() == ChartMode::TopP95,
-                        icon: "flame",
-                        label: if multi_day { "Slowest" } else { "Top Slowest" },
-                        title: "Top p95 Slowest Endpoints",
-                        onclick: move |_| mode.set(ChartMode::TopP95),
-                    }
-                }
-            }
-
-            if let Some(svg) = svg {
-                div {
-                    class: "px-3 py-3 w-full",
-                    style: "height: {chart_h}px;",
-                    div { class: "recharts-responsive-container", style: "width: 100%; height: 100%; min-width: 0px;",
-                        div { style: "width: 0px; height: 0px; overflow: visible;",
-                            div {
-                                width: "{svg_w}",
-                                height: "{svg_h}",
-                                class: "recharts-wrapper",
-                                style: "position: relative; cursor: default; width: {svg_w}px; height: {svg_h}px;",
-                                // Recharts renders the hidden tooltip and the legend
-                                // before the chart SVG inside `.recharts-wrapper`.
-                                div {
-                                    tabindex: "-1",
-                                    class: "recharts-tooltip-wrapper",
-                                    style: "visibility: hidden; pointer-events: none; position: absolute; top: 0px; left: 0px;",
-                                }
-                                if let Some(legend) = legend {
-                                    div { dangerous_inner_html: legend }
-                                }
-                                div { dangerous_inner_html: svg }
-                            }
-                        }
-                    }
-                }
-            } else {
-                div { class: "px-3 py-12 text-center text-sm text-slate-400 dark:text-slate-500",
-                    "No chart data available yet."
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn ChartTab(
-    active: bool,
-    icon: String,
-    label: String,
-    title: String,
-    onclick: EventHandler<()>,
-) -> Element {
-    rsx! {
-        button {
-            r#type: "button",
-            onclick: move |_| onclick.call(()),
-            class: cn(&[
-                "flex flex-1 items-center justify-center gap-1.5 whitespace-nowrap rounded px-2 py-1 font-medium transition-colors cursor-pointer border-0",
-                if active {
-                    "bg-white text-blue-600 shadow-xs dark:bg-blue-600 dark:text-white dark:shadow-md dark:shadow-blue-950/50"
-                } else {
-                    "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200"
-                },
-            ]),
-            title: "{title}",
-            Icon { name: icon, class: "h-3.5 w-3.5" }
-            span { "{label}" }
-        }
-    }
-}
-
-// ── Legend ──────────────────────────────────────────────────────────────────
-
-fn legend_html(items: &[(&str, &str)], width: f64, color: &str) -> String {
-    let mut out = String::new();
-    out.push_str(&format!(
-        "<div class=\"recharts-legend-wrapper\" style=\"position: absolute; width: {width}px; height: auto; left: 0px; bottom: 4px; font-size: 11px; padding-top: 4px; color: {color};\">"
-    ));
-    out.push_str("<ul class=\"recharts-default-legend\" style=\"padding: 0px; margin: 0px; text-align: center;\">");
-    for (i, (name, item_color)) in items.iter().enumerate() {
-        out.push_str(&format!(
-            "<li class=\"recharts-legend-item legend-item-{i}\" style=\"display: inline-block; margin-right: 10px; white-space: nowrap;\">"
-        ));
-        out.push_str(&format!(
-            "<svg aria-label=\"{name} legend icon\" class=\"recharts-surface\" width=\"14\" height=\"14\" viewBox=\"0 0 32 32\" style=\"display: inline-block; vertical-align: middle; margin-right: 4px;\">"
-        ));
-        out.push_str("<title></title><desc></desc>");
-        out.push_str(&format!(
-            "<path fill=\"{item_color}\" cx=\"16\" cy=\"16\" class=\"recharts-symbols\" transform=\"translate(16, 16)\" d=\"M16,0A16,16,0,1,1,-16,0A16,16,0,1,1,16,0\"></path>"
-        ));
-        out.push_str("</svg>");
-        out.push_str(&format!(
-            "<span class=\"recharts-legend-item-text\" style=\"color: {item_color}; white-space: normal; overflow-wrap: break-word;\">{name}</span>"
-        ));
-        out.push_str("</li>");
-    }
-    out.push_str("</ul></div>");
-    out
+    let bar_color = if is_dark { BAR_BLUE_DARK } else { BAR_BLUE };
+    let error_color = if is_dark { ERROR_RED_DARK } else { ERROR_RED };
+    render_chart(
+        mode,
+        width,
+        height,
+        hourly,
+        daily,
+        rows,
+        grid_color,
+        tick_color,
+        category_tick,
+        bar_color,
+        error_color,
+    )
 }
 
 // ── Recharts math ───────────────────────────────────────────────────────────
@@ -394,7 +277,7 @@ fn calculate_step(
     )
 }
 
-fn nice_ticks(min: f64, max: f64, tick_count: usize, allow_decimals: bool) -> Vec<f64> {
+pub(crate) fn nice_ticks(min: f64, max: f64, tick_count: usize, allow_decimals: bool) -> Vec<f64> {
     let count = tick_count.max(2);
     let (cormin, cormax) = if min > max { (max, min) } else { (min, max) };
     if cormin == cormax {
@@ -429,6 +312,14 @@ fn nice_ticks(min: f64, max: f64, tick_count: usize, allow_decimals: bool) -> Ve
 fn format_tick(value: f64, kind: AxisKind) -> String {
     match kind {
         AxisKind::NumberMs => format_ms(value),
+        AxisKind::NumberPlain => {
+            if value.is_finite() {
+                // Trim float noise from the tick math (85.00000000000001 → 85).
+                trim_num((value * 1000.0).round() / 1000.0)
+            } else {
+                "-".to_string()
+            }
+        }
         AxisKind::NumberCount => {
             if !value.is_finite() {
                 "-".to_string()
@@ -497,21 +388,21 @@ fn text_height(font_size: f64) -> f64 {
 
 // ── Scales ──────────────────────────────────────────────────────────────────
 
-fn linear(v: f64, d0: f64, d1: f64, r0: f64, r1: f64) -> f64 {
+pub(crate) fn linear(v: f64, d0: f64, d1: f64, r0: f64, r1: f64) -> f64 {
     if d1 == d0 {
         return r0;
     }
     r0 + (v - d0) / (d1 - d0) * (r1 - r0)
 }
 
-fn point_coord(i: usize, n: usize, x: f64, w: f64) -> f64 {
+pub(crate) fn point_coord(i: usize, n: usize, x: f64, w: f64) -> f64 {
     if n <= 1 {
         return x + w / 2.0;
     }
     x + w * i as f64 / (n as f64 - 1.0)
 }
 
-fn band_coord(i: usize, n: usize, x: f64, w: f64) -> f64 {
+pub(crate) fn band_coord(i: usize, n: usize, x: f64, w: f64) -> f64 {
     let band = w / n.max(1) as f64;
     x + band * (i as f64 + 0.5)
 }
@@ -588,7 +479,7 @@ fn bezier(out: &mut String, x0: f64, y0: f64, x1: f64, y1: f64, t0: f64, t1: f64
 }
 
 /// d3 `curveMonotoneX` path over the given points.
-fn monotone_curve(points: &[(f64, f64)]) -> String {
+pub(crate) fn monotone_curve(points: &[(f64, f64)]) -> String {
     let n = points.len();
     let mut out = String::new();
     if n == 0 {
@@ -698,12 +589,12 @@ fn rounded_rect_path(x: f64, y: f64, w: f64, h: f64, r: [f64; 4]) -> String {
 
 // ── SVG emission ────────────────────────────────────────────────────────────
 
-struct Svg {
+pub(crate) struct Svg {
     out: String,
 }
 
 impl Svg {
-    fn new(w: f64, h: f64) -> Self {
+    pub(crate) fn new(w: f64, h: f64) -> Self {
         let mut out = String::new();
         out.push_str(&format!(
             "<svg role=\"application\" tabindex=\"0\" class=\"recharts-surface\" width=\"{}\" height=\"{}\" viewBox=\"0 0 {} {}\" style=\"width: 100%; height: 100%; display: block;\">",
@@ -716,13 +607,79 @@ impl Svg {
         Self { out }
     }
 
-    fn finish(mut self) -> String {
+    pub(crate) fn finish(mut self) -> String {
         self.out.push_str("</svg>");
         self.out
     }
+
+    /// Raw SVG fragment (Recharts markup is emitted verbatim for parity).
+    pub(crate) fn raw(&mut self, fragment: &str) {
+        self.out.push_str(fragment);
+    }
+
+    /// Recharts-style bar rect with optional rounded top corners.
+    pub(crate) fn bar(
+        &mut self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        radius: f64,
+        fill: &str,
+        opacity: f64,
+        name: &str,
+        value: f64,
+    ) {
+        let h = h.max(0.0);
+        let path = if radius > 0.0 && h > radius {
+            format!(
+                "M{x0} {y0}h{w0}a{r} {r} 0 0 1 {r} {r}v{h0}a{r} {r} 0 0 1 -{r} {r}h-{w0}a{r} {r} 0 0 1 -{r} -{r}v-{h0}a{r} {r} 0 0 1 {r} -{r}z",
+                x0 = trim_num(x),
+                y0 = trim_num(y + radius),
+                w0 = trim_num(w - radius * 2.0),
+                h0 = trim_num(h - radius * 2.0),
+                r = trim_num(radius),
+            )
+        } else {
+            format!(
+                "M{} {}h{}v{}h-{}z",
+                trim_num(x),
+                trim_num(y),
+                trim_num(w),
+                trim_num(h),
+                trim_num(w)
+            )
+        };
+        self.out.push_str(&format!(
+            "<path name=\"{name}\" value=\"{}\" fill=\"{fill}\" fill-opacity=\"{opacity}\" d=\"{path}\" class=\"recharts-rectangle\"></path>",
+            trim_num(value)
+        ));
+    }
+
+    /// Axis tick label in Recharts' markup shape.
+    pub(crate) fn tick_text(&mut self, x: f64, y: f64, anchor: &str, fill: &str, content: &str) {
+        self.out.push_str(&format!(
+            "<text x=\"{}\" y=\"{}\" text-anchor=\"{anchor}\" fill=\"{fill}\" font-size=\"{}\" class=\"recharts-text recharts-cartesian-axis-tick-value\">{content}</text>",
+            trim_num(x),
+            trim_num(y),
+            trim_num(FONT_SIZE)
+        ));
+    }
+
+    /// Polyline for a `type="monotone"` line series.
+    pub(crate) fn curve(&mut self, points: &[(f64, f64)], stroke: &str, width: f64, name: &str) {
+        if points.is_empty() {
+            return;
+        }
+        let d = monotone_curve(points);
+        self.out.push_str(&format!(
+            "<path name=\"{name}\" stroke=\"{stroke}\" stroke-width=\"{}\" fill=\"none\" class=\"recharts-curve recharts-line-curve\" d=\"{d}\"></path>",
+            trim_num(width)
+        ));
+    }
 }
 
-fn trim_num(v: f64) -> String {
+pub(crate) fn trim_num(v: f64) -> String {
     if v.fract() == 0.0 {
         format!("{}", v as i64)
     } else {
@@ -730,7 +687,7 @@ fn trim_num(v: f64) -> String {
     }
 }
 
-fn grid_lines(svg: &mut Svg, plot: Rect, ticks: &[Tick], color: &str, vertical: bool) {
+pub(crate) fn grid_lines(svg: &mut Svg, plot: Rect, ticks: &[Tick], color: &str, vertical: bool) {
     if ticks.is_empty() {
         return;
     }
@@ -762,7 +719,7 @@ fn grid_lines(svg: &mut Svg, plot: Rect, ticks: &[Tick], color: &str, vertical: 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_axis(svg: &mut Svg, axis: &Axis, plot: Rect) {
+pub(crate) fn emit_axis(svg: &mut Svg, axis: &Axis, plot: Rect) {
     let (line_x1, line_y1, line_x2, line_y2) = match axis.orientation {
         Orientation::Bottom => (plot.x, axis.axis_line, plot.x + plot.w, axis.axis_line),
         Orientation::Left => (axis.axis_line, plot.y, axis.axis_line, plot.y + plot.h),
@@ -1407,7 +1364,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_numeric_axis(
+pub(crate) fn build_numeric_axis(
     tick_values: &[f64],
     kind: AxisKind,
     orientation: Orientation,
@@ -1443,7 +1400,7 @@ fn build_numeric_axis(
     }
 }
 
-fn x_axis(
+pub(crate) fn x_axis(
     ticks: &[Tick],
     _x: f64,
     axis_line: f64,
@@ -1543,4 +1500,396 @@ fn distribution_buckets(rows: &[AggregatedEndpoint]) -> Vec<(String, u64)> {
         .into_iter()
         .map(|(label, count, _)| (label.to_string(), count))
         .collect()
+}
+
+// ── View ────────────────────────────────────────────────────────────────────
+
+use iced::widget::{button, column, container, row, space, stack, svg, text};
+use iced::{Center, Element, Fill, Length, Padding};
+
+use crate::app::{App, Message};
+use crate::store::analysis_store::ChartLayout;
+use crate::ui::{icons, style};
+
+/// `LatencyChart` card: tab bar, cached SVG plot and the Recharts legend.
+pub fn view(app: &App) -> Element<'_, Message> {
+    let is_dark = app.analysis.is_dark();
+    let wide = app.analysis.chart_layout == ChartLayout::Wide;
+    let muted = if is_dark {
+        style::SLATE_400
+    } else {
+        style::SLATE_500
+    };
+    let multi_day = app
+        .analysis
+        .result
+        .as_ref()
+        .is_some_and(|result| result.daily_stats.len() > 1);
+    let (svg_width, svg_height, host_height) =
+        chart_size(f64::from(app.window_width), wide);
+
+    let mut heading = row![text("API VISUAL ANALYTICS")
+        .size(12)
+        .font(style::SEMIBOLD)
+        .style(style::text_body)];
+    if app.analysis.filters.date_filter != "all" {
+        heading = heading.push(
+            container(
+                text(format_date(Some(&app.analysis.filters.date_filter)))
+                    .size(10)
+                    .font(style::SEMIBOLD)
+                    .style(style::text_accent),
+            )
+            .padding([2, 8])
+            .style(style::info_pill),
+        );
+    }
+    let layout_button = button(
+        row![
+            icons::icon(if wide { "columns2" } else { "rows2" }, 12.0, muted),
+            text(if wide { "Split View" } else { "Wide View" }).size(11),
+        ]
+        .spacing(4)
+        .align_y(Center),
+    )
+    .on_press(Message::ToggleChartLayout)
+    .padding([4, 8])
+    .style(style::btn_secondary);
+
+    let header = container(
+        row![heading, space().width(Fill), layout_button]
+            .spacing(8)
+            .align_y(Center),
+    )
+    .width(Fill)
+    .padding(Padding {
+        top: 10.0,
+        right: 14.0,
+        bottom: 10.0,
+        left: 14.0,
+    });
+
+    let mut tabs = row![].spacing(4).width(Fill);
+    if multi_day {
+        tabs = tabs.push(tab(app, ChartMode::DailyTrend, multi_day));
+    }
+    for mode in [
+        ChartMode::TimeOfDay,
+        ChartMode::Throughput,
+        ChartMode::Distribution,
+        ChartMode::TopP95,
+    ] {
+        tabs = tabs.push(tab(app, mode, multi_day));
+    }
+
+    let plot: Element<'_, Message> = match &app.chart {
+        Some(handle) => {
+            let chart: Element<'_, Message> = svg(handle.clone())
+                .width(Length::Fixed(svg_width as f32))
+                .height(Length::Fixed(svg_height as f32))
+                .content_fit(iced::ContentFit::Fill)
+                .into();
+            column![
+                stack![chart, hover_layer(app, svg_width, svg_height)],
+                legend(app, is_dark),
+            ]
+            .spacing(4)
+            .into()
+        }
+        None => container(
+            text("No chart data available yet.")
+                .size(14)
+                .style(style::text_faint),
+        )
+        .width(Fill)
+        .center_x(Fill)
+        .padding(Padding {
+            top: 48.0,
+            right: 12.0,
+            bottom: 48.0,
+            left: 12.0,
+        })
+        .into(),
+    };
+
+    container(
+        column![
+            header,
+            // The reference tab strip is flex-1 with `whitespace-nowrap`, so the
+            // labels keep their natural width and the strip clips at the card.
+            container(
+                container(tabs)
+                    .padding(2)
+                    .style(style::segmented)
+                    .clip(true),
+            )
+            .padding(Padding {
+                top: 0.0,
+                right: 14.0,
+                bottom: 10.0,
+                left: 14.0,
+            }),
+            container(plot)
+                .width(Fill)
+                .height(Length::Fixed(host_height as f32))
+                .center_x(Fill)
+                .padding(Padding {
+                    top: 0.0,
+                    right: 12.0,
+                    bottom: 12.0,
+                    left: 12.0,
+                }),
+        ]
+        .spacing(0),
+    )
+    .width(Fill)
+    .style(style::card)
+    .into()
+}
+
+fn tab(app: &App, mode: ChartMode, multi_day: bool) -> Element<'_, Message> {
+    let active = app.chart_mode == mode;
+    let color = if active {
+        if app.analysis.is_dark() {
+            iced::Color::WHITE
+        } else {
+            style::BLUE_600
+        }
+    } else if app.analysis.is_dark() {
+        style::SLATE_400
+    } else {
+        style::SLATE_600
+    };
+
+    button(
+        row![
+            icons::icon(mode.icon(), 14.0, color),
+            text(mode.label(multi_day))
+                .size(12)
+                .font(style::MEDIUM)
+                .wrapping(iced::widget::text::Wrapping::None),
+        ]
+        .spacing(6)
+        .align_y(Center),
+    )
+    .on_press(Message::ChartMode(mode))
+    .padding([4, 8])
+    .style(style::chart_tab(active))
+    .into()
+}
+
+/// Invisible per-category hit zones plus the Recharts-style tooltip card.
+///
+/// The chart itself stays a cached SVG; hovering only swaps which category the
+/// overlay card describes, so no chart math runs on the mouse path.
+fn hover_layer(app: &App, width: f64, height: f64) -> Element<'_, Message> {
+    let slots = tooltip_slots(app);
+    if slots.is_empty() {
+        return iced::widget::space().into();
+    }
+
+    // TopP95 is a horizontal bar chart: rows, not columns.
+    if app.chart_mode == ChartMode::TopP95 {
+        return top_p95_hover_layer(app, width, height, slots);
+    }
+
+    let n = slots.len();
+    // Plot rect shared by the hourly modes: 64px left axis, 16px right margin,
+    // and the plot stops above the x axis + legend.
+    let plot_x = 64.0_f32;
+    let plot_w = (width as f32 - plot_x - 16.0).max(1.0);
+    let plot_h = (height as f32 - 56.0).max(1.0);
+    let band = plot_w / n as f32;
+
+    let mut zones = row![].spacing(0).width(Length::Fixed(plot_w));
+    for index in 0..n {
+        let zone = container(iced::widget::space())
+            .width(Length::Fixed(band))
+            .height(Length::Fixed(plot_h));
+        zones = zones.push(
+            iced::widget::mouse_area(zone)
+                .on_enter(Message::ChartHover(Some(index)))
+                .on_exit(Message::ChartHover(None)),
+        );
+    }
+
+    let positioned = container(zones).padding(Padding {
+        top: 0.0,
+        right: 16.0,
+        bottom: 0.0,
+        left: plot_x,
+    });
+
+    match app.chart_hover.and_then(|index| slots.get(index).cloned()) {
+        Some(slot) => stack![positioned, tooltip_card(slot)].into(),
+        None => positioned.into(),
+    }
+}
+
+#[derive(Clone)]
+struct TooltipSlot {
+    label: String,
+    rows: Vec<(&'static str, String, iced::Color)>,
+}
+
+
+
+/// Values shown on hover, mirroring the reference's `<Tooltip>` formatters.
+fn tooltip_slots(app: &App) -> Vec<TooltipSlot> {
+    let Some(result) = app.analysis.result.as_ref() else {
+        return Vec::new();
+    };
+    let hour_slot = |bucket: &HourlyBucket, prefix: &str| TooltipSlot {
+        label: format!("{prefix}: {:02}:00", bucket.hour),
+        rows: vec![
+            ("P99 Latency", format_ms(bucket.p99_ms), style::from_hex(P99)),
+            ("P95 Latency", format_ms(bucket.p95_ms), style::from_hex(P95)),
+            ("Avg Latency", format_ms(bucket.avg_ms), style::from_hex(AVG)),
+        ],
+    };
+
+    match app.chart_mode {
+        ChartMode::DailyTrend if result.daily_stats.len() > 1 => result
+            .daily_stats
+            .iter()
+            .map(|day| TooltipSlot {
+                label: format!("Date: {}", format_date(Some(&day.date))),
+                rows: vec![
+                    ("Total Requests", format_num(day.count), style::from_hex(BAR_BLUE)),
+                    ("P95 Latency", format_ms(day.p95_ms), style::from_hex(P95)),
+                    ("Avg Latency", format_ms(day.avg_ms), style::from_hex(AVG)),
+                ],
+            })
+            .collect(),
+        ChartMode::DailyTrend | ChartMode::TimeOfDay => result
+            .hourly_stats
+            .iter()
+            .map(|bucket| hour_slot(bucket, "Time"))
+            .collect(),
+        ChartMode::Throughput => result
+            .hourly_stats
+            .iter()
+            .map(|bucket| TooltipSlot {
+                label: format!("Hour: {:02}:00", bucket.hour),
+                rows: vec![
+                    (
+                        "Total Requests",
+                        format_num(bucket.count),
+                        style::from_hex(BAR_BLUE),
+                    ),
+                    ("Errors", format_num(bucket.error_count), style::from_hex(ERROR_RED)),
+                ],
+            })
+            .collect(),
+        ChartMode::Distribution => distribution_buckets(&app.api_rows)
+            .into_iter()
+            .map(|(label, count)| TooltipSlot {
+                label: format!("Latency Range: {label}"),
+                rows: vec![("Requests", format_num(count), style::from_hex(BAR_BLUE))],
+            })
+            .collect(),
+        ChartMode::TopP95 => app
+            .api_rows
+            .iter()
+            .take(20)
+            .map(|row| TooltipSlot {
+                label: row.path.clone(),
+                rows: vec![("P95 Latency", format_ms(row.p95_ms), style::from_hex(P95))],
+            })
+            .collect(),
+    }
+}
+
+/// Row hit zones for the TopP95 horizontal bars (`margin 4/16/4/4`, Y axis 150).
+fn top_p95_hover_layer(
+    app: &App,
+    width: f64,
+    height: f64,
+    slots: Vec<TooltipSlot>,
+) -> Element<'_, Message> {
+    let plot_x = 154.0_f32;
+    let plot_w = (width as f32 - plot_x - 16.0).max(1.0);
+    let plot_y = 4.0_f32;
+    let plot_h = (height as f32 - 4.0 - 4.0 - 30.0).max(1.0);
+    let band = plot_h / slots.len().max(1) as f32;
+
+    let mut zones = column![].spacing(0).width(Length::Fixed(plot_w));
+    for index in 0..slots.len() {
+        zones = zones.push(
+            iced::widget::mouse_area(
+                container(iced::widget::space())
+                    .width(Length::Fixed(plot_w))
+                    .height(Length::Fixed(band)),
+            )
+            .on_enter(Message::ChartHover(Some(index)))
+            .on_exit(Message::ChartHover(None)),
+        );
+    }
+
+    let positioned = container(zones).padding(Padding {
+        top: plot_y,
+        right: 16.0,
+        bottom: 0.0,
+        left: plot_x,
+    });
+
+    match app.chart_hover.and_then(|index| slots.get(index).cloned()) {
+        Some(slot) => stack![positioned, tooltip_card(slot)].into(),
+        None => positioned.into(),
+    }
+}
+
+fn tooltip_card(slot: TooltipSlot) -> Element<'static, Message> {
+    let mut rows = column![text(slot.label)
+        .size(11)
+        .font(style::MONO)
+        .style(style::text_heading)]
+    .spacing(3);
+
+    for (name, value, color) in slot.rows {
+        rows = rows.push(
+            row![
+                container(iced::widget::space().width(7.0).height(7.0))
+                    .width(Length::Fixed(7.0))
+                    .height(Length::Fixed(7.0))
+                    .style(style::dot(color)),
+                text(name).size(10).style(style::text_muted),
+                iced::widget::space().width(Length::Fixed(12.0)),
+                text(value)
+                    .size(10)
+                    .font(style::SEMIBOLD)
+                    .style(style::text_body),
+            ]
+            .spacing(4)
+            .align_y(Center),
+        );
+    }
+
+    container(rows)
+        .padding(8)
+        .style(style::chart_tooltip)
+        .into()
+}
+
+fn legend(app: &App, is_dark: bool) -> Element<'_, Message> {
+    let mut items = row![].spacing(10).align_y(Center);
+    for (name, color) in legend_items(app.chart_mode, is_dark) {
+        let color = style::from_hex(color);
+        items = items.push(
+            row![
+                container(space().width(8.0).height(8.0))
+                    .width(Length::Fixed(8.0))
+                    .height(Length::Fixed(8.0))
+                    .style(style::dot(color)),
+                text(name).size(11).style(move |_theme| {
+                    iced::widget::text::Style {
+                        color: Some(color),
+                    }
+                }),
+            ]
+            .spacing(4)
+            .align_y(Center),
+        );
+    }
+    container(items).width(Fill).center_x(Fill).into()
 }

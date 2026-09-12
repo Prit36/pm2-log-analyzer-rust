@@ -1,339 +1,475 @@
 //! `CronTable` — port of `src/components/CronTable.tsx`.
 
-use dioxus::prelude::*;
+use std::fmt;
 
-use crate::core::models::CronAggregated;
-use crate::store::{
-    reaggregate, set_filters, show_toast, use_analysis_store, CronSortKey, SortDirection,
+use iced::widget::text::Wrapping;
+use iced::widget::{
+    button, checkbox, column, container, mouse_area, pick_list, responsive, row, scrollable, space,
+    text, text_input,
 };
-use crate::ui::icons::Icon;
-use crate::utils::cn::cn;
+use iced::{Center, Element, Fill, Length, Padding, Right};
+
+use crate::app::{App, Message};
+use crate::core::models::CronAggregated;
+use crate::store::analysis_store::{CronSortKey, SortDirection};
+use crate::ui::virtualize;
+use crate::ui::{hrule, icons, style};
 use crate::utils::format::{format_ms, format_num};
-use crate::utils::table_ops::{build_cron_tsv, copy_to_clipboard};
+use crate::utils::text_fit;
 
-const FIELD_CLASS: &str = "rounded border border-slate-200 bg-white px-2 py-1.5 text-xs text-slate-800 focus:border-blue-500 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100 dark:focus:border-blue-400";
+const ROW_HEIGHT: f32 = 32.0;
+const HEADER_HEIGHT: f32 = 32.0;
+const OVERSCAN: usize = 6;
+/// Numeric column widths, mirroring the reference grid template.
+const COL_RUNS: f32 = 56.0;
+const COL_STARTS: f32 = 56.0;
+const COL_FAILS: f32 = 56.0;
+const COL_AVG: f32 = 64.0;
+const COL_P95: f32 = 64.0;
+const COL_P99: f32 = 64.0;
+const COL_MAX: f32 = 64.0;
+const COL_LAST: f32 = 64.0;
+const NUMERIC_WIDTH: f32 = COL_RUNS
+    + COL_STARTS
+    + COL_FAILS
+    + COL_AVG
+    + COL_P95
+    + COL_P99
+    + COL_MAX
+    + COL_LAST;
+/// `px-3` on the row/header grid plus the eight `gap-1` gutters.
+const NAME_INSET: f32 = 24.0 + 8.0 * 4.0;
 
-fn cron_sort_key_str(key: CronSortKey) -> &'static str {
-    match key {
-        CronSortKey::P95Ms => "p95Ms",
-        CronSortKey::P99Ms => "p99Ms",
-        CronSortKey::AvgMs => "avgMs",
-        CronSortKey::MaxMs => "maxMs",
-        CronSortKey::Runs => "runs",
-        CronSortKey::Starts => "starts",
-        CronSortKey::Fails => "fails",
-        CronSortKey::LastDurationMs => "lastDurationMs",
-        CronSortKey::Name => "name",
+const SORT_OPTIONS: &[CronSortKey] = &[
+    CronSortKey::P95Ms,
+    CronSortKey::P99Ms,
+    CronSortKey::AvgMs,
+    CronSortKey::MaxMs,
+    CronSortKey::Runs,
+    CronSortKey::Starts,
+    CronSortKey::Fails,
+    CronSortKey::LastDurationMs,
+    CronSortKey::Name,
+];
+
+impl fmt::Display for CronSortKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            CronSortKey::P95Ms => "p95",
+            CronSortKey::P99Ms => "p99",
+            CronSortKey::AvgMs => "avg",
+            CronSortKey::MaxMs => "max",
+            CronSortKey::Runs => "runs",
+            CronSortKey::Starts => "starts",
+            CronSortKey::Fails => "fails",
+            CronSortKey::LastDurationMs => "last",
+            CronSortKey::Name => "job",
+        })
     }
 }
 
-fn parse_cron_sort_key(value: &str) -> Option<CronSortKey> {
-    match value {
-        "p95Ms" => Some(CronSortKey::P95Ms),
-        "p99Ms" => Some(CronSortKey::P99Ms),
-        "avgMs" => Some(CronSortKey::AvgMs),
-        "maxMs" => Some(CronSortKey::MaxMs),
-        "runs" => Some(CronSortKey::Runs),
-        "starts" => Some(CronSortKey::Starts),
-        "fails" => Some(CronSortKey::Fails),
-        "lastDurationMs" => Some(CronSortKey::LastDurationMs),
-        "name" => Some(CronSortKey::Name),
-        _ => None,
+pub fn view(app: &App) -> Element<'_, Message> {
+    let rows = &app.cron_rows;
+    let filters = &app.analysis.filters;
+    let is_dark = app.analysis.is_dark();
+
+    let query = text_input("Filter jobs…", &filters.cron_query)
+        .on_input(Message::CronQueryChanged)
+        .padding([7, 8])
+        .size(12)
+        .line_height(iced::Pixels(crate::ui::lh::TEXT_XS))
+        .width(Length::Fixed(160.0))
+        .style(style::field);
+    let min_ms = text_input("Min ms", &app.cron_min_ms_input)
+        .on_input(Message::CronMinMsChanged)
+        .padding([7, 8])
+        .size(12)
+        .line_height(iced::Pixels(crate::ui::lh::TEXT_XS))
+        .width(Length::Fixed(80.0))
+        .style(style::field);
+    let failures = checkbox(filters.cron_show_failed_only)
+        .label("Failures only")
+        .on_toggle(Message::CronFailedOnly)
+        .size(14)
+        .text_size(11)
+        .style(style::check);
+    let sort = pick_list(
+        SORT_OPTIONS,
+        Some(filters.cron_sort_key),
+        Message::CronSortKeyChanged,
+    )
+    .padding([7, 8])
+    .text_size(12)
+    .text_line_height(iced::Pixels(crate::ui::lh::TEXT_XS))
+    .style(style::picker);
+
+    let mut copy = button(
+        row![
+            icons::icon(
+                "copy",
+                12.0,
+                if is_dark {
+                    style::SLATE_400
+                } else {
+                    style::SLATE_500
+                }
+            ),
+            text("Copy TSV")
+                .size(11)
+                .font(style::MEDIUM)
+                .style(style::text_muted),
+        ]
+        .spacing(4)
+        .align_y(Center),
+    )
+    .padding(0)
+    .style(style::btn_ghost);
+    if !rows.is_empty() {
+        copy = copy.on_press(Message::CopyCronTsv);
     }
-}
 
-#[component]
-pub fn CronTable(rows: Vec<CronAggregated>) -> Element {
-    let store = use_analysis_store();
-    let filters = store.filters();
-    let height = 360.0_f64.min(120.0_f64.max(rows.len() as f64 * 32.0 + 36.0));
-    let rows_for_copy = rows.clone();
+    let controls = container(
+        row![
+            crate::ui::lined_styled(
+                "CRON JOBS",
+                12.0,
+                style::SEMIBOLD,
+                crate::ui::lh::TEXT_XS,
+                style::text_subheading,
+            ),
+            space().width(Fill),
+            query,
+            min_ms,
+            failures,
+            sort,
+            copy,
+        ]
+        .spacing(8)
+        .align_y(Center)
+        .padding(Padding {
+            top: 8.0,
+            right: 12.0,
+            bottom: 8.0,
+            left: 12.0,
+        }),
+    )
+    .width(Fill);
 
-    rsx! {
-        section { class: "overflow-hidden rounded border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900",
-            div { class: "flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-3 py-2 dark:border-slate-800",
-                h2 { class: "text-xs font-semibold uppercase tracking-wide text-slate-600 dark:text-slate-300",
-                    "Cron jobs"
-                }
-                div { class: "flex flex-wrap items-center gap-2",
-                    input {
-                        r#type: "search",
-                        value: "{filters.cron_query}",
-                        oninput: move |e: Event<FormData>| {
-                            let mut f = store.filters();
-                            f.cron_query = e.value();
-                            set_filters(store, f);
-                            reaggregate(store);
-                        },
-                        placeholder: "Filter jobs…",
-                        class: cn(&[FIELD_CLASS, "w-40"]),
-                    }
-                    input {
-                        r#type: "number",
-                        min: "0",
-                        value: "{fmt_ms_input(filters.cron_min_ms)}",
-                        oninput: move |e: Event<FormData>| {
-                            let mut f = store.filters();
-                            f.cron_min_ms = e.value().parse::<f64>().unwrap_or(0.0).max(0.0);
-                            set_filters(store, f);
-                            reaggregate(store);
-                        },
-                        title: "Min duration ms",
-                        class: cn(&[FIELD_CLASS, "w-20"]),
-                        placeholder: "Min ms",
-                    }
-                    label { class: "flex items-center gap-1.5 text-[11px] text-slate-600 dark:text-slate-400",
-                        input {
-                            r#type: "checkbox",
-                            checked: filters.cron_show_failed_only,
-                            onchange: move |e: Event<FormData>| {
-                                let mut f = store.filters();
-                                f.cron_show_failed_only = e.checked();
-                                set_filters(store, f);
-                                reaggregate(store);
-                            },
-                        }
-                        "Failures only"
-                    }
-                    select {
-                        value: "{cron_sort_key_str(filters.cron_sort_key)}",
-                        onchange: move |e: Event<FormData>| {
-                            if let Some(key) = parse_cron_sort_key(&e.value()) {
-                                let mut f = store.filters();
-                                f.cron_sort_key = key;
-                                f.cron_sort_dir = if key == CronSortKey::Name {
-                                    SortDirection::Asc
-                                } else {
-                                    SortDirection::Desc
-                                };
-                                set_filters(store, f);
-                            }
-                        },
-                        class: "{FIELD_CLASS}",
-                        option { value: "p95Ms", "p95" }
-                        option { value: "p99Ms", "p99" }
-                        option { value: "avgMs", "avg" }
-                        option { value: "maxMs", "max" }
-                        option { value: "runs", "runs" }
-                        option { value: "starts", "starts" }
-                        option { value: "fails", "fails" }
-                        option { value: "lastDurationMs", "last" }
-                        option { value: "name", "job" }
-                    }
-                    button {
-                        r#type: "button",
-                        onclick: move |_| {
-                            if rows_for_copy.is_empty() {
-                                return;
-                            }
-                            if copy_to_clipboard(&build_cron_tsv(&rows_for_copy)) {
-                                show_toast(store, "Cron table copied — paste into Excel");
-                            }
-                        },
-                        disabled: rows.is_empty(),
-                        class: "inline-flex items-center gap-1 text-[11px] font-medium text-slate-500 hover:text-slate-800 disabled:opacity-40 dark:text-slate-400 dark:hover:text-slate-200 cursor-pointer border-0 bg-transparent",
-                        Icon { name: "copy", class: "size-3" }
-                        "Copy TSV"
-                    }
-                }
-            }
-            if rows.is_empty() {
-                div { class: "px-3 py-8 text-center text-sm text-slate-400 dark:text-slate-500",
-                    "No cron jobs match filters."
-                }
-            } else {
-                div { style: "height: {height}px;",
-                    div { class: "grid grid-cols-[minmax(0,1.2fr)_56px_56px_56px_64px_64px_64px_64px_64px] items-center gap-1 border-b border-slate-100 bg-slate-50 px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-400",
-                        CronSortHeader {
-                            label: "Job",
-                            col_key: CronSortKey::Name,
-                            current_key: filters.cron_sort_key,
-                            current_dir: filters.cron_sort_dir,
-                            align_left: true,
-                        }
-                        CronSortHeader {
-                            label: "Runs",
-                            col_key: CronSortKey::Runs,
-                            current_key: filters.cron_sort_key,
-                            current_dir: filters.cron_sort_dir,
-                            align_left: false,
-                        }
-                        CronSortHeader {
-                            label: "Starts",
-                            col_key: CronSortKey::Starts,
-                            current_key: filters.cron_sort_key,
-                            current_dir: filters.cron_sort_dir,
-                            align_left: false,
-                        }
-                        CronSortHeader {
-                            label: "Fails",
-                            col_key: CronSortKey::Fails,
-                            current_key: filters.cron_sort_key,
-                            current_dir: filters.cron_sort_dir,
-                            align_left: false,
-                        }
-                        CronSortHeader {
-                            label: "Avg",
-                            col_key: CronSortKey::AvgMs,
-                            current_key: filters.cron_sort_key,
-                            current_dir: filters.cron_sort_dir,
-                            align_left: false,
-                        }
-                        CronSortHeader {
-                            label: "p95",
-                            col_key: CronSortKey::P95Ms,
-                            current_key: filters.cron_sort_key,
-                            current_dir: filters.cron_sort_dir,
-                            align_left: false,
-                        }
-                        CronSortHeader {
-                            label: "p99",
-                            col_key: CronSortKey::P99Ms,
-                            current_key: filters.cron_sort_key,
-                            current_dir: filters.cron_sort_dir,
-                            align_left: false,
-                        }
-                        CronSortHeader {
-                            label: "Max",
-                            col_key: CronSortKey::MaxMs,
-                            current_key: filters.cron_sort_key,
-                            current_dir: filters.cron_sort_dir,
-                            align_left: false,
-                        }
-                        CronSortHeader {
-                            label: "Last",
-                            col_key: CronSortKey::LastDurationMs,
-                            current_key: filters.cron_sort_key,
-                            current_dir: filters.cron_sort_dir,
-                            align_left: false,
-                        }
-                    }
-                    div { class: "overflow-auto", style: "height: {height - 36.0}px;",
-                        div { style: "height: {rows.len() * 32}px; width: 100%;",
-                            for (index, row) in rows.iter().enumerate() {
-                                {
-                                    let is_even = index % 2 == 0;
-                                    let row_bg = if is_even { "bg-white dark:bg-slate-900" } else { "bg-slate-50/50 dark:bg-slate-950/40" };
-                                    let fails_class = if row.fails > 0 {
-                                        "text-right tabular-nums font-semibold text-rose-600 dark:text-rose-400"
-                                    } else {
-                                        "text-right tabular-nums text-slate-400 dark:text-slate-600"
-                                    };
-                                    rsx! {
-                                        div {
-                                            key: "{row.name}",
-                                            class: cn(&[
-                                                "grid grid-cols-[minmax(0,1.2fr)_56px_56px_56px_64px_64px_64px_64px_64px] items-center gap-1 border-b border-slate-100 px-3 text-xs dark:border-slate-800",
-                                                row_bg,
-                                            ]),
-                                            style: "height: 32px;",
-                                            div { class: "truncate font-mono-data text-[11px] text-slate-800 dark:text-slate-200",
-                                                "{row.name}"
-                                            }
-                                            div { class: "text-right tabular-nums text-slate-700 dark:text-slate-300",
-                                                "{format_num(row.runs)}"
-                                            }
-                                            div { class: "text-right tabular-nums text-slate-400 dark:text-slate-500",
-                                                "{format_num(row.starts)}"
-                                            }
-                                            div { class: "{fails_class}", "{format_num(row.fails)}" }
-                                            div { class: "text-right tabular-nums text-slate-700 dark:text-slate-300",
-                                                "{format_ms(row.avg_ms)}"
-                                            }
-                                            div { class: "text-right tabular-nums font-semibold text-blue-600 dark:text-blue-400",
-                                                "{format_ms(row.p95_ms)}"
-                                            }
-                                            div { class: "text-right tabular-nums text-slate-700 dark:text-slate-300",
-                                                "{format_ms(row.p99_ms)}"
-                                            }
-                                            div { class: "text-right tabular-nums text-slate-700 dark:text-slate-300",
-                                                "{format_ms(row.max_ms)}"
-                                            }
-                                            div { class: "text-right tabular-nums text-slate-400 dark:text-slate-500",
-                                                {match row.last_duration_ms {
-                                                    Some(ms) => format_ms(ms),
-                                                    None => "-".to_string(),
-                                                }}
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
+    let header = container(
+        row![
+            sort_header(
+                "Job",
+                CronSortKey::Name,
+                filters.cron_sort_key,
+                filters.cron_sort_dir,
+                0.0,
+                is_dark,
+                app.cron_header_hover,
+                true,
+            ),
+            sort_header(
+                "Runs",
+                CronSortKey::Runs,
+                filters.cron_sort_key,
+                filters.cron_sort_dir,
+                COL_RUNS,
+                is_dark,
+                app.cron_header_hover,
+                false,
+            ),
+            sort_header(
+                "Starts",
+                CronSortKey::Starts,
+                filters.cron_sort_key,
+                filters.cron_sort_dir,
+                COL_STARTS,
+                is_dark,
+                app.cron_header_hover,
+                false,
+            ),
+            sort_header(
+                "Fails",
+                CronSortKey::Fails,
+                filters.cron_sort_key,
+                filters.cron_sort_dir,
+                COL_FAILS,
+                is_dark,
+                app.cron_header_hover,
+                false,
+            ),
+            sort_header(
+                "Avg",
+                CronSortKey::AvgMs,
+                filters.cron_sort_key,
+                filters.cron_sort_dir,
+                COL_AVG,
+                is_dark,
+                app.cron_header_hover,
+                false,
+            ),
+            sort_header(
+                "p95",
+                CronSortKey::P95Ms,
+                filters.cron_sort_key,
+                filters.cron_sort_dir,
+                COL_P95,
+                is_dark,
+                app.cron_header_hover,
+                false,
+            ),
+            sort_header(
+                "p99",
+                CronSortKey::P99Ms,
+                filters.cron_sort_key,
+                filters.cron_sort_dir,
+                COL_P99,
+                is_dark,
+                app.cron_header_hover,
+                false,
+            ),
+            sort_header(
+                "Max",
+                CronSortKey::MaxMs,
+                filters.cron_sort_key,
+                filters.cron_sort_dir,
+                COL_MAX,
+                is_dark,
+                app.cron_header_hover,
+                false,
+            ),
+            sort_header(
+                "Last",
+                CronSortKey::LastDurationMs,
+                filters.cron_sort_key,
+                filters.cron_sort_dir,
+                COL_LAST,
+                is_dark,
+                app.cron_header_hover,
+                false,
+            ),
+        ]
+        .spacing(4)
+        .align_y(Center)
+        .padding(Padding {
+            top: 0.0,
+            right: 12.0,
+            bottom: 0.0,
+            left: 12.0,
+        }),
+    )
+    .width(Fill)
+    .height(Length::Fixed(HEADER_HEIGHT))
+    .style(style::table_header);
 
-fn fmt_ms_input(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{}", value as i64)
+    let body: Element<'_, Message> = if rows.is_empty() {
+        container(
+            text("No cron jobs match filters.")
+                .size(14)
+                .style(style::text_faint),
+        )
+        .width(Fill)
+        .center_x(Fill)
+        .padding(Padding {
+            top: 32.0,
+            right: 12.0,
+            bottom: 32.0,
+            left: 12.0,
+        })
+        .into()
     } else {
-        format!("{value}")
-    }
+        let total_height = (rows.len() as f32 * ROW_HEIGHT + HEADER_HEIGHT).clamp(120.0, 360.0);
+        let viewport_height = (total_height - HEADER_HEIGHT).max(0.0);
+        responsive(move |size| {
+            let name_width = (f64::from(size.width) - f64::from(NUMERIC_WIDTH + NAME_INSET)).max(0.0);
+            let (start, end) = virtualize::visible_range(
+                rows.len(),
+                app.cron_scroll,
+                viewport_height,
+                ROW_HEIGHT,
+                OVERSCAN,
+            );
+
+            let mut list = column![].spacing(0).width(Fill);
+            if start > 0 {
+                list = list.push(space().height(start as f32 * ROW_HEIGHT));
+            }
+            for (index, row_data) in rows[start..end].iter().enumerate() {
+                list = list.push(cron_row(start + index, row_data, name_width as f32));
+                list = list.push(hrule(style::row_divider));
+            }
+            if end < rows.len() {
+                list = list.push(space().height((rows.len() - end) as f32 * ROW_HEIGHT));
+            }
+
+            scrollable(list)
+                .on_scroll(Message::CronScrolled)
+                .height(Length::Fixed(viewport_height))
+                .width(Fill)
+                .into()
+        })
+        .height(Length::Fixed(viewport_height))
+        .into()
+    };
+
+    container(column![
+        controls,
+        hrule(style::divider),
+        header,
+        hrule(style::divider),
+        body
+    ]
+    .spacing(0))
+        .width(Fill)
+        .style(style::card)
+        .into()
 }
 
-#[component]
-fn CronSortHeader(
-    label: String,
-    col_key: CronSortKey,
+fn cron_row(index: usize, row_data: &CronAggregated, name_width: f32) -> Element<'static, Message> {
+    let name = text_fit::truncate_mono(&row_data.name, 11.0, name_width);
+    container(
+        row![
+            container(
+                text(name.into_owned())
+                    .size(11)
+                    .font(style::MONO)
+                    .style(style::text_strong)
+                    .wrapping(Wrapping::None)
+            )
+            .width(Fill)
+            .clip(true),
+            numeric(format_num(row_data.runs), COL_RUNS, style::text_body, false),
+            numeric(
+                format_num(row_data.starts),
+                COL_STARTS,
+                style::text_faint,
+                false
+            ),
+            numeric(
+                format_num(row_data.fails),
+                COL_FAILS,
+                if row_data.fails > 0 {
+                    style::text_danger
+                } else {
+                    style::text_fainter
+                },
+                row_data.fails > 0
+            ),
+            numeric(format_ms(row_data.avg_ms), COL_AVG, style::text_body, false),
+            numeric(format_ms(row_data.p95_ms), COL_P95, style::text_accent, true),
+            numeric(format_ms(row_data.p99_ms), COL_P99, style::text_body, false),
+            numeric(format_ms(row_data.max_ms), COL_MAX, style::text_body, false),
+            numeric(
+                row_data
+                    .last_duration_ms
+                    .map(format_ms)
+                    .unwrap_or_else(|| "-".to_string()),
+                COL_LAST,
+                style::text_faint,
+                false
+            ),
+        ]
+        .spacing(4)
+        .align_y(Center)
+        .padding(Padding {
+            top: 0.0,
+            right: 12.0,
+            bottom: 0.0,
+            left: 12.0,
+        }),
+    )
+    .width(Fill)
+    .height(Length::Fixed(ROW_HEIGHT - 1.0))
+    .style(move |theme| style::table_row(theme, index.is_multiple_of(2)))
+    .into()
+}
+
+fn numeric(
+    value: String,
+    width: f32,
+    text_style: fn(&iced::Theme) -> iced::widget::text::Style,
+    semibold: bool,
+) -> Element<'static, Message> {
+    container(
+        text(value)
+            .size(12)
+            .font(if semibold {
+                style::SEMIBOLD
+            } else {
+                style::REGULAR
+            })
+            .style(text_style),
+    )
+    .width(Length::Fixed(width))
+    .align_x(Right)
+    .into()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sort_header(
+    label: &'static str,
+    key: CronSortKey,
     current_key: CronSortKey,
     current_dir: SortDirection,
+    width: f32,
+    is_dark: bool,
+    hovered: Option<CronSortKey>,
     align_left: bool,
-) -> Element {
-    let store = use_analysis_store();
-    let is_active = current_key == col_key;
-    let title = format!(
-        "Sort by {label} ({})",
-        if is_active && current_dir == SortDirection::Desc {
-            "descending"
+) -> Element<'static, Message> {
+    let active = current_key == key;
+    let accent = if is_dark {
+        style::BLUE_400
+    } else {
+        style::BLUE_600
+    };
+    let (icon, size, color) = if active {
+        let icon = if current_dir == SortDirection::Asc {
+            "arrow-up"
         } else {
-            "ascending"
-        }
-    );
-    rsx! {
-        button {
-            r#type: "button",
-            onclick: move |_| {
-                let mut f = store.filters();
-                if f.cron_sort_key == col_key {
-                    f.cron_sort_dir = if f.cron_sort_dir == SortDirection::Asc {
-                        SortDirection::Desc
-                    } else {
-                        SortDirection::Asc
-                    };
-                } else {
-                    f.cron_sort_key = col_key;
-                    f.cron_sort_dir = if col_key == CronSortKey::Name {
-                        SortDirection::Asc
-                    } else {
-                        SortDirection::Desc
-                    };
-                }
-                set_filters(store, f);
-            },
-            class: cn(&[
-                "group flex w-full items-center gap-1 cursor-pointer select-none transition-colors border-0 bg-transparent",
-                if align_left { "justify-start text-left" } else { "justify-end text-right" },
-                if is_active {
-                    "font-bold text-blue-600 dark:text-blue-400"
-                } else {
-                    "text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200"
-                },
-            ]),
-            title: "{title}",
-            span { "{label}" }
-            if is_active {
-                if current_dir == SortDirection::Asc {
-                    Icon { name: "arrow-up", class: "size-3 shrink-0" }
-                } else {
-                    Icon { name: "arrow-down", class: "size-3 shrink-0" }
-                }
-            } else {
-                Icon { name: "arrow-up-down", class: "size-2.5 shrink-0 opacity-0 group-hover:opacity-60 transition-opacity" }
-            }
-        }
-    }
+            "arrow-down"
+        };
+        (icon, 12.0, accent)
+    } else {
+        ("arrow-up-down", 10.0, style::SLATE_500)
+    };
+    let show_icon = active || hovered == Some(key);
+
+    let text_style: fn(&iced::Theme) -> iced::widget::text::Style = if active {
+        style::text_accent
+    } else {
+        style::text_muted
+    };
+    let font = if active { style::BOLD } else { style::SEMIBOLD };
+    let label = text(label)
+        .size(10)
+        .font(font)
+        .style(text_style)
+        .wrapping(Wrapping::None);
+
+    let content: Element<'static, Message> = if show_icon {
+        row![label, icons::icon(icon, size, color)]
+            .spacing(4)
+            .align_y(Center)
+            .into()
+    } else {
+        row![label, space().width(size).height(size)]
+            .spacing(4)
+            .align_y(Center)
+            .into()
+    };
+
+    let header = button(content)
+        .on_press(Message::CronSortToggled(key))
+        .padding(0)
+        .style(style::sort_header(active));
+
+    let aligned = if align_left {
+        container(header).align_x(iced::Left)
+    } else {
+        container(header).width(Length::Fixed(width)).align_x(Right)
+    };
+
+    mouse_area(aligned)
+        .on_enter(Message::CronHeaderHovered(Some(key)))
+        .on_exit(Message::CronHeaderHovered(None))
+        .into()
 }

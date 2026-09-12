@@ -1,6 +1,5 @@
-//! App mode store — mirrors `src/store/appModeStore.ts`.
+//! App mode state — mirrors `src/store/appModeStore.ts`.
 
-use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::persist;
@@ -23,35 +22,7 @@ struct ModeState {
     mode: AppMode,
 }
 
-#[derive(Clone, Copy)]
-pub struct AppModeStore {
-    pub mode: Signal<AppMode>,
-}
-
-impl AppModeStore {
-    pub fn mode(&self) -> AppMode {
-        (self.mode)()
-    }
-
-    pub fn new() -> Self {
-        Self {
-            mode: Signal::new(AppMode::Pm2),
-        }
-    }
-}
-
-impl Default for AppModeStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub fn use_app_mode_store() -> AppModeStore {
-    use_context::<AppModeStore>()
-}
-
-pub fn set_mode(mut store: AppModeStore, mode: AppMode) {
-    store.mode.set(mode);
+pub fn persist_mode(mode: AppMode) {
     let envelope = PersistedMode {
         state: ModeState { mode },
         version: 0,
@@ -60,19 +31,9 @@ pub fn set_mode(mut store: AppModeStore, mode: AppMode) {
     persist::set_item("app-analyzer-mode", &json);
 }
 
-pub fn toggle_mode(store: AppModeStore) {
-    let next = if store.mode() == AppMode::Pm2 {
-        AppMode::Mongo
-    } else {
-        AppMode::Pm2
-    };
-    set_mode(store, next);
-}
-
-pub async fn restore_persisted_mode(mut store: AppModeStore) {
-    if let Some(raw) = persist::load_item("app-analyzer-mode").await {
-        if let Ok(envelope) = serde_json::from_str::<PersistedMode>(&raw) {
-            store.mode.set(envelope.state.mode);
-        }
-    }
+pub fn restore_mode() -> Option<AppMode> {
+    let raw = persist::load_item("app-analyzer-mode")?;
+    serde_json::from_str::<PersistedMode>(&raw)
+        .ok()
+        .map(|envelope| envelope.state.mode)
 }

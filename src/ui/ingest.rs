@@ -1,15 +1,13 @@
 //! `IngestPanel` — port of `src/components/IngestPanel.tsx`.
 
-use dioxus::html::HasFileData;
-use dioxus::prelude::*;
-
-use crate::core::pm2::LoadedSource;
-use crate::store::{
-    cancel, handle_log_files_upload, parse_text, set_source_paste, show_toast, use_analysis_store,
-    AnalysisStore, PASTE_WARN_BYTES,
+use iced::widget::{
+    button, column, container, progress_bar, row, space, text, text_editor,
 };
-use crate::ui::icons::Icon;
-use crate::utils::cn::cn;
+use iced::{Center, Element, Fill, Length, Padding};
+
+use crate::app::{App, Message, PASTE_EDITOR_ID};
+use crate::core::pm2::LoadedSource;
+use crate::ui::{icons, style};
 use crate::utils::format::format_bytes;
 
 const ACCEPT_EXTENSIONS: &[&str] = &["log", "txt", "out", "err", "zip", "gz", "json"];
@@ -32,16 +30,23 @@ pub fn is_valid_file_path(path: &std::path::Path) -> bool {
         if parts.len() >= 2 && parts[parts.len() - 2] == "log" {
             return true;
         }
-        if name.rsplit('.').next().is_some_and(|e| e.chars().all(|c| c.is_ascii_digit())) {
+        if name
+            .rsplit('.')
+            .next()
+            .is_some_and(|e| e.chars().all(|c| c.is_ascii_digit()))
+        {
             return true;
         }
     }
     false
 }
 
-fn pick_files() -> Vec<LoadedSource> {
+pub fn pick_files() -> Vec<LoadedSource> {
     let Some(paths) = rfd::FileDialog::new()
-        .add_filter("Log files", &["log", "txt", "out", "err", "gz", "zip", "json", "1", "2", "3"])
+        .add_filter(
+            "Log files",
+            &["log", "txt", "out", "err", "gz", "zip", "json", "1", "2", "3"],
+        )
         .pick_files()
     else {
         return Vec::new();
@@ -53,388 +58,414 @@ fn pick_files() -> Vec<LoadedSource> {
         .collect()
 }
 
-fn busy(store: AnalysisStore) -> bool {
-    store.is_parsing()
-}
-
-#[component]
-pub fn IngestPanel() -> Element {
-    let mut store = use_analysis_store();
-    let mut drag_over = use_signal(|| false);
-    let mut pending_drop = use_signal(|| None::<Vec<LoadedSource>>);
-    let mut paste_text = use_signal(String::new);
-
-    let is_parsing = store.is_parsing();
-    let has_data = store.has_data();
-    let loaded_files = store.loaded_files();
-    let paste_open = store.paste_open();
-    let progress = store.progress();
-    let is_busy = busy(store);
-
-    let mut execute_append = move |files: Vec<LoadedSource>| {
-        pending_drop.set(None);
-        handle_log_files_upload(store, files, true);
-    };
-    let mut execute_replace = move |files: Vec<LoadedSource>| {
-        pending_drop.set(None);
-        handle_log_files_upload(store, files, false);
-    };
-
-    let mut open_picker = move |append: bool| {
-        if busy(store) {
-            return;
-        }
-        let files = pick_files();
-        if files.is_empty() {
-            return;
-        }
-        if append && store.has_data() && !store.loaded_files().is_empty() {
-            execute_append(files);
-        } else {
-            execute_replace(files);
-        }
-    };
-
-    let on_drop = move |event: Event<DragData>| {
-        drag_over.set(false);
-        if busy(store) {
-            return;
-        }
-        let Some(files) = event.data().files() else {
-            return;
-        };
-        let sources: Vec<LoadedSource> = files
-            .files()
-            .into_iter()
-            .map(std::path::PathBuf::from)
-            .filter(|p| is_valid_file_path(p))
-            .map(LoadedSource::Path)
-            .collect();
-        if sources.is_empty() {
-            show_toast(
-                store,
-                "Please upload log, text, or archive files (.log, .zip, .gz, .txt, etc.)",
-            );
-            return;
-        }
-        if store.has_data() && !store.loaded_files().is_empty() {
-            pending_drop.set(Some(sources));
-        } else {
-            execute_replace(sources);
-        }
-    };
-
-    let analyze_paste = move |_| {
-        let text = paste_text().trim().to_string();
-        if text.is_empty() {
-            show_toast(store, "Paste some log lines first");
-            return;
-        }
-        let bytes = text.len();
-        if bytes > PASTE_WARN_BYTES {
-            show_toast(
-                store,
-                format!(
-                    "Paste is {} — save as a .log file and upload instead (limit ~{})",
-                    format_bytes(bytes as u64),
-                    format_bytes(PASTE_WARN_BYTES as u64)
-                ),
-            );
-            return;
-        }
-        set_source_paste(store);
-        parse_text(store, text);
-    };
-
-    let drag_class = if drag_over() {
-        if has_data {
-            "bg-blue-50/80 dark:bg-blue-950/40"
-        } else {
-            "bg-blue-50 dark:bg-blue-950/40"
+pub fn view(app: &App) -> Element<'_, Message> {
+    let mut card = column![].spacing(0).width(Fill);
+    if app.analysis.has_data {
+        card = card.push(compact_row(app));
+        if app.analysis.is_parsing {
+            card = card.push(progress_strip(app));
         }
     } else {
-        "bg-white dark:bg-slate-900"
+        card = card.push(drop_zone(app));
+    }
+
+    if let Some(pending) = &app.pending_drop {
+        card = card.push(pending_banner(app, pending.len()));
+    }
+    if app.analysis.paste_open {
+        card = card.push(paste_editor(app));
+    }
+
+    container(card).width(Fill).style(style::card).into()
+}
+
+fn compact_row(app: &App) -> Element<'_, Message> {
+    let is_dark = app.analysis.is_dark();
+    let is_parsing = app.analysis.is_parsing;
+
+    let files = loaded_files(&app.analysis.loaded_files);
+
+    let actions: Element<'_, Message> = if is_parsing {
+        row![
+            parse_status(app),
+            cancel_button(),
+        ]
+        .spacing(12)
+        .align_y(Center)
+        .into()
+    } else {
+        row![
+            primary_action("file-plus", "Add / Append", Message::Browse { append: true }),
+            secondary_action("refresh-cw", "Replace", Message::Browse { append: false }),
+            secondary_action("clipboard-paste", "Paste", Message::TogglePaste),
+        ]
+        .spacing(8)
+        .into()
     };
 
-    rsx! {
-        section { "data-ui-id": "ingest-panel", class: "rounded border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900",
-            if has_data {
-                div {
-                    class: cn(&[
-                        "relative flex flex-wrap items-center justify-between gap-3 px-4 py-2.5 transition-colors",
-                        drag_class,
-                        if is_busy { "opacity-60" } else { "" },
-                    ]),
-                    ondragover: move |event: Event<DragData>| {
-                        event.prevent_default();
-                        if !busy(store) {
-                            drag_over.set(true);
-                        }
-                    },
-                    ondragleave: move |_| drag_over.set(false),
-                    ondrop: on_drop,
-                    div { class: "flex min-w-0 flex-1 flex-wrap items-center gap-2",
-                        Icon { name: "upload", class: "size-4 shrink-0 text-slate-400 dark:text-slate-500" }
-                        LoadedFilesDisplay { files: loaded_files.clone() }
-                    }
-                    div { class: "flex shrink-0 items-center gap-2",
-                        if is_parsing {
-                            div { class: "flex items-center gap-3",
-                                if let Some(p) = progress.clone() {
-                                    div { class: "flex items-center gap-2 font-mono-data text-xs text-slate-600 dark:text-slate-300",
-                                        span { class: "capitalize", "{p.stage}" }
-                                        span { class: "font-semibold text-blue-600 dark:text-blue-400",
-                                            "{p.percent}%"
-                                        }
-                                    }
-                                }
-                                button {
-                                    r#type: "button",
-                                    onclick: move |_| cancel(store),
-                                    class: "rounded border border-rose-200 bg-rose-50 px-2.5 py-1 text-xs font-medium text-rose-700 hover:bg-rose-100 dark:border-rose-900/50 dark:bg-rose-950/40 dark:text-rose-300 dark:hover:bg-rose-900/60 cursor-pointer",
-                                    "Cancel"
-                                }
-                            }
-                        } else {
-                            button {
-                                r#type: "button",
-                                disabled: is_busy,
-                                onclick: move |_| open_picker(true),
-                                class: "inline-flex items-center gap-1.5 rounded bg-blue-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-40 cursor-pointer border-0",
-                                Icon { name: "file-plus", class: "size-3.5" }
-                                "Add / Append"
-                            }
-                            button {
-                                r#type: "button",
-                                disabled: is_busy,
-                                onclick: move |_| open_picker(false),
-                                class: "inline-flex items-center gap-1.5 rounded border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700 cursor-pointer",
-                                Icon { name: "refresh-cw", class: "size-3.5" }
-                                "Replace"
-                            }
-                            button {
-                                r#type: "button",
-                                disabled: is_busy,
-                                onclick: move |_| store.paste_open.set(!store.paste_open()),
-                                class: "inline-flex items-center gap-1.5 rounded border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700 cursor-pointer",
-                                Icon { name: "clipboard-paste", class: "size-3.5" }
-                                "Paste"
-                            }
-                        }
-                    }
-                    if is_parsing {
-                        if let Some(p) = progress.clone() {
-                            div { class: "absolute inset-x-0 bottom-0 h-0.5 overflow-hidden bg-slate-100 dark:bg-slate-800",
-                                div {
-                                    class: "h-full bg-blue-600 transition-[width] duration-150",
-                                    style: "width: {p.percent}%",
-                                }
-                            }
-                        }
-                    }
+    container(
+        row![
+            icons::icon(
+                "upload",
+                16.0,
+                if is_dark {
+                    style::SLATE_500
+                } else {
+                    style::SLATE_400
                 }
+            ),
+            files,
+            space().width(Fill),
+            actions,
+        ]
+        .spacing(10)
+        .align_y(Center)
+        .padding(Padding {
+            top: 10.0,
+            right: 16.0,
+            bottom: 10.0,
+            left: 16.0,
+        }),
+    )
+    .width(Fill)
+    .style(style::card)
+    .into()
+}
+
+fn drop_zone(app: &App) -> Element<'_, Message> {
+    let is_dark = app.analysis.is_dark();
+    let is_parsing = app.analysis.is_parsing;
+
+    let mut content = column![
+        icons::icon(
+            "upload",
+            32.0,
+            if is_dark {
+                style::SLATE_500
             } else {
-                div {
-                    class: cn(&[
-                        "flex flex-col items-center justify-center gap-3 px-6 py-10 text-center transition-colors",
-                        drag_class,
-                        if is_busy { "opacity-60" } else { "" },
-                    ]),
-                    ondragover: move |event: Event<DragData>| {
-                        event.prevent_default();
-                        if !busy(store) {
-                            drag_over.set(true);
-                        }
-                    },
-                    ondragleave: move |_| drag_over.set(false),
-                    ondrop: on_drop,
-                    Icon { name: "upload", class: "size-8 text-slate-400 dark:text-slate-500" }
-                    div {
-                        p { class: "text-sm font-medium text-slate-800 dark:text-slate-200",
-                            if is_parsing { "Parsing PM2 log file(s)…" } else { "Drop PM2 / API logs or .zip archive" }
-                        }
-                        p { class: "mt-1 text-xs text-slate-500 dark:text-slate-400",
-                            ".log / .log.1 / .gz / .zip (auto-classifies API & MongoDB logs)"
-                        }
-                    }
-                    if is_parsing {
-                        div { class: "w-full max-w-md space-y-3",
-                            if let Some(p) = progress.clone() {
-                                div {
-                                    div { class: "mb-1.5 flex justify-between text-[11px] text-slate-500 dark:text-slate-400",
-                                        span { class: "capitalize", "{p.stage}" }
-                                        span { class: "font-mono-data font-semibold text-blue-600 dark:text-blue-400",
-                                            "{p.percent}%"
-                                        }
-                                    }
-                                    div { class: "h-2 overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800",
-                                        div {
-                                            class: "h-full bg-blue-600 transition-[width] duration-150",
-                                            style: "width: {p.percent}%",
-                                        }
-                                    }
-                                }
-                            }
-                            button {
-                                r#type: "button",
-                                onclick: move |_| cancel(store),
-                                class: "rounded border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-100 dark:border-rose-900/50 dark:bg-rose-950/40 dark:text-rose-300 dark:hover:bg-rose-900/60 cursor-pointer",
-                                "Cancel"
-                            }
-                        }
-                    } else {
-                        div { class: "flex flex-wrap items-center justify-center gap-2",
-                            button {
-                                r#type: "button",
-                                disabled: is_busy,
-                                onclick: move |_| open_picker(false),
-                                class: "rounded bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-40 cursor-pointer border-0",
-                                "Browse files"
-                            }
-                            button {
-                                r#type: "button",
-                                disabled: is_busy,
-                                onclick: move |_| store.paste_open.set(!store.paste_open()),
-                                class: "inline-flex items-center gap-1.5 rounded border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700 cursor-pointer",
-                                Icon { name: "clipboard-paste", class: "size-3.5" }
-                                "Paste logs"
-                            }
-                        }
-                        p { class: "max-w-lg font-mono-data text-[11px] leading-relaxed text-slate-400 dark:text-slate-500",
-                            "Example: 2026-07-24T00:00:10: GET /api/health 200 12.5 ms - 42"
-                        }
-                    }
-                }
+                style::SLATE_400
             }
+        ),
+        text(if is_parsing {
+            "Parsing PM2 log file(s)…"
+        } else {
+            "Drop PM2 / API logs or .zip archive"
+        })
+        .size(14)
+        .font(style::MEDIUM)
+        .style(style::text_primary),
+        text(".log / .log.1 / .gz / .zip (auto-classifies API & MongoDB logs)")
+            .size(12)
+            .style(style::text_muted),
+    ]
+    .spacing(8)
+    .align_x(Center);
 
-            if let Some(pending) = pending_drop() {
-                PendingDropBanner {
-                    pending: pending,
-                    loaded_count: loaded_files.len(),
-                    on_append: move |files: Vec<LoadedSource>| execute_append(files),
-                    on_replace: move |files: Vec<LoadedSource>| execute_replace(files),
-                    on_cancel: move |_| pending_drop.set(None),
-                }
-            }
-
-            if paste_open {
-                div { class: "border-t border-slate-200 px-4 py-3 dark:border-slate-800",
-                    label {
-                        class: "mb-1.5 block text-xs font-medium text-slate-600 dark:text-slate-300",
-                        r#for: "paste-logs",
-                        "Paste log lines (not persisted; max ~"
-                        {format_bytes(PASTE_WARN_BYTES as u64)}
-                        ")"
-                    }
-                    textarea {
-                        id: "paste-logs",
-                        value: "{paste_text}",
-                        oninput: move |e: Event<FormData>| paste_text.set(e.value()),
-                        disabled: is_busy,
-                        rows: "6",
-                        placeholder: "Paste PM2 stdout/stderr here…",
-                        class: "w-full resize-y rounded border border-slate-200 bg-slate-50 px-3 py-2 font-mono-data text-xs text-slate-800 placeholder:text-slate-400 focus:border-blue-500 focus:bg-white dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:bg-slate-900",
-                    }
-                    div { class: "mt-2 flex justify-end",
-                        button {
-                            r#type: "button",
-                            disabled: is_busy,
-                            onclick: analyze_paste,
-                            class: "rounded bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-40 cursor-pointer border-0",
-                            "Analyze paste"
-                        }
-                    }
-                }
-            }
-        }
+    if is_parsing {
+        let percent = app
+            .analysis
+            .progress
+            .as_ref()
+            .map(|progress| progress.percent)
+            .unwrap_or(0);
+        content = content.push(
+            column![
+                row![
+                    text(
+                        app.analysis
+                            .progress
+                            .as_ref()
+                            .map(|progress| progress.stage.clone())
+                            .unwrap_or_default()
+                    )
+                    .size(11)
+                    .style(style::text_muted),
+                    space().width(Fill),
+                    text(format!("{percent}%"))
+                        .size(11)
+                        .font(style::SEMIBOLD)
+                        .style(style::text_accent),
+                ]
+                .align_y(Center),
+                progress_bar(0.0..=100.0, percent as f32)
+                    .girth(8.0)
+                    .style(style::progress),
+                cancel_button(),
+            ]
+            .spacing(10)
+            .align_x(Center)
+            .width(Fill),
+        );
+    } else {
+        content = content.push(
+            row![
+                primary_action(
+                    "upload",
+                    "Browse files",
+                    Message::Browse { append: false }
+                ),
+                secondary_action("clipboard-paste", "Paste logs", Message::TogglePaste),
+            ]
+            .spacing(8),
+        );
+        content = content.push(
+            text("Example: 2026-07-24T00:00:10: GET /api/health 200 12.5 ms - 42")
+                .size(11)
+                .font(style::MONO)
+                .style(style::text_faint),
+        );
     }
+
+    container(content)
+        .width(Fill)
+        .padding(Padding {
+            top: 40.0,
+            right: 24.0,
+            bottom: 40.0,
+            left: 24.0,
+        })
+        .center_x(Fill)
+        .style(move |theme| style::drop_zone(theme, app.drag_over))
+        .into()
 }
 
-#[component]
-fn LoadedFilesDisplay(files: Vec<LoadedSource>) -> Element {
+fn loaded_files(files: &[LoadedSource]) -> Element<'_, Message> {
     if files.is_empty() {
-        return rsx! {
-            span { class: "truncate text-xs font-medium text-slate-700 dark:text-slate-300",
-                "Logs loaded"
-            }
-        };
+        return text("Logs loaded")
+            .size(12)
+            .font(style::MEDIUM)
+            .style(style::text_primary)
+            .into();
     }
-    let shown: Vec<LoadedSource> = files.iter().take(5).cloned().collect();
+
+    let mut chips = row![text(format!(
+        "{} file{}:",
+        files.len(),
+        if files.len() > 1 { "s" } else { "" }
+    ))
+    .size(12)
+    .font(style::SEMIBOLD)
+    .style(style::text_primary)]
+    .spacing(6)
+    .align_y(Center);
+
+    for file in files.iter().take(5) {
+        let name = file.name();
+        let size = format_bytes(file.size());
+        chips = chips.push(
+            container(
+                row![
+                    text(name)
+                        .size(11)
+                        .font(style::MONO)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                    text(size).size(10).style(style::text_faint),
+                ]
+                .spacing(4)
+                .align_y(Center),
+            )
+            .padding([2, 8])
+            .style(style::file_chip),
+        );
+    }
+
     let extra = files.len().saturating_sub(5);
-    rsx! {
-        div { class: "flex min-w-0 flex-wrap items-center gap-1.5",
-            span { class: "text-xs font-semibold text-slate-700 dark:text-slate-300",
-                "{files.len()} file"
-                if files.len() > 1 { "s" }
-                ":"
-            }
-            for file in shown {
-                span {
-                    key: "{file.name()}-{file.size()}",
-                    class: "inline-flex items-center gap-1 rounded bg-slate-100 px-2 py-0.5 font-mono-data text-[11px] text-slate-700 dark:bg-slate-800 dark:text-slate-300",
-                    title: "{file.name()} ({format_bytes(file.size())})",
-                    span { class: "max-w-[150px] truncate", "{file.name()}" }
-                    span { class: "text-[10px] text-slate-400 dark:text-slate-500",
-                        "{format_bytes(file.size())}"
-                    }
-                }
-            }
-            if extra > 0 {
-                span { class: "text-[11px] font-medium text-slate-500 dark:text-slate-400",
-                    "+{extra} more"
-                }
-            }
-        }
+    if extra > 0 {
+        chips = chips.push(
+            text(format!("+{extra} more"))
+                .size(11)
+                .style(style::text_muted),
+        );
     }
+
+    chips.into()
 }
 
-#[component]
-fn PendingDropBanner(
-    pending: Vec<LoadedSource>,
-    loaded_count: usize,
-    on_append: EventHandler<Vec<LoadedSource>>,
-    on_replace: EventHandler<Vec<LoadedSource>>,
-    on_cancel: EventHandler<()>,
-) -> Element {
-    let count = pending.len();
-    let append_payload = pending.clone();
-    let replace_payload = pending.clone();
-    rsx! {
-        div { class: "border-t border-blue-200 bg-blue-50/90 p-3.5 text-left dark:border-blue-900 dark:bg-slate-800",
-            div { class: "mx-auto max-w-md",
-                p { class: "text-xs font-semibold text-slate-800 dark:text-slate-200",
-                    "You dropped {count} file"
-                    if count > 1 { "s" }
-                }
-                p { class: "mt-0.5 text-[11px] text-slate-600 dark:text-slate-400",
-                    "{loaded_count} file"
-                    if loaded_count > 1 { "s currently loaded" } else { " currently loaded" }
-                    ". How would you like to proceed?"
-                }
-                div { class: "mt-2.5 flex flex-wrap items-center gap-2",
-                    button {
-                        r#type: "button",
-                        onclick: move |_| on_append.call(append_payload.clone()),
-                        class: "inline-flex items-center gap-1 rounded bg-blue-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-blue-700 cursor-pointer border-0",
-                        Icon { name: "plus", class: "size-3.5" }
-                        "Append to current"
+fn parse_status(app: &App) -> Element<'_, Message> {
+    let (stage, percent) = app
+        .analysis
+        .progress
+        .as_ref()
+        .map(|progress| (progress.stage.clone(), progress.percent))
+        .unwrap_or_default();
+
+    row![
+        text(stage)
+            .size(12)
+            .font(style::MONO)
+            .style(style::text_muted),
+        text(format!("{percent}%"))
+            .size(12)
+            .font(style::MONO)
+            .style(style::text_accent),
+    ]
+    .spacing(8)
+    .align_y(Center)
+    .into()
+}
+
+fn progress_strip(app: &App) -> Element<'_, Message> {
+    let percent = app
+        .analysis
+        .progress
+        .as_ref()
+        .map(|progress| progress.percent)
+        .unwrap_or(0);
+    container(
+        progress_bar(0.0..=100.0, percent as f32)
+            .girth(2.0)
+            .style(style::progress),
+    )
+    .width(Fill)
+    .into()
+}
+
+fn pending_banner(app: &App, count: usize) -> Element<'_, Message> {
+    let loaded = app.analysis.loaded_files.len();
+    container(
+        column![
+            text(format!(
+                "You dropped {count} file{}",
+                if count > 1 { "s" } else { "" }
+            ))
+            .size(12)
+            .font(style::SEMIBOLD)
+            .style(style::text_primary),
+            text(format!(
+                "{loaded} file{} currently loaded. How would you like to proceed?",
+                if loaded > 1 { "s" } else { "" }
+            ))
+            .size(11)
+            .style(style::text_muted),
+            row![
+                primary_action("plus", "Append to current", Message::PendingDropAppend),
+                secondary_action("refresh-cw", "Replace current", Message::PendingDropReplace),
+                button(icons::icon(
+                    "x",
+                    14.0,
+                    if app.analysis.is_dark() {
+                        style::SLATE_400
+                    } else {
+                        style::SLATE_500
                     }
-                    button {
-                        r#type: "button",
-                        onclick: move |_| on_replace.call(replace_payload.clone()),
-                        class: "inline-flex items-center gap-1 rounded border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200 dark:hover:bg-slate-600 cursor-pointer",
-                        Icon { name: "refresh-cw", class: "size-3.5" }
-                        "Replace current"
-                    }
-                    button {
-                        r#type: "button",
-                        onclick: move |_| on_cancel.call(()),
-                        class: "rounded p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer border-0 bg-transparent",
-                        title: "Cancel",
-                        Icon { name: "x", class: "size-3.5" }
-                    }
-                }
-            }
-        }
+                ))
+                .on_press(Message::PendingDropCancel)
+                .padding(4)
+                .style(style::btn_ghost),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        ]
+        .spacing(4),
+    )
+    .width(Fill)
+    .padding(Padding {
+        top: 14.0,
+        right: 16.0,
+        bottom: 14.0,
+        left: 16.0,
+    })
+    .style(style::pending_banner)
+    .into()
+}
+
+fn paste_editor(app: &App) -> Element<'_, Message> {
+    let disabled = app.analysis.is_parsing;
+    let editor = text_editor(&app.paste_text)
+        .id(iced::widget::Id::new(PASTE_EDITOR_ID))
+        .placeholder("Paste PM2 stdout/stderr here…")
+        .on_action(Message::PasteEdit)
+        .padding(8)
+        .size(12)
+        .height(Length::Fixed(120.0))
+        .style(style::editor);
+
+    let mut analyze = button(
+        text("Analyze paste")
+            .size(12)
+            .font(style::MEDIUM)
+            .style(style::text_white),
+    )
+    .padding([4, 10])
+    .style(style::btn_solid);
+    if !disabled {
+        analyze = analyze.on_press(Message::PasteAnalyze);
     }
+
+    container(
+        column![
+            text(format!(
+                "Paste log lines (not persisted; max ~{})",
+                format_bytes(crate::store::analysis_store::PASTE_WARN_BYTES as u64)
+            ))
+            .size(12)
+            .style(style::text_muted),
+            editor,
+            container(analyze)
+                .width(Fill)
+                .align_x(iced::Right)
+                .padding(iced::Padding {
+                    top: 8.0,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                }),
+        ]
+        .spacing(6),
+    )
+    .width(Fill)
+    .padding(Padding {
+        top: 12.0,
+        right: 16.0,
+        bottom: 12.0,
+        left: 16.0,
+    })
+    .into()
+}
+
+fn primary_action(icon: &'static str, label: &'static str, message: Message) -> Element<'static, Message> {
+    button(
+        row![
+            icons::icon(icon, 14.0, iced::Color::WHITE),
+            text(label).size(12).font(style::MEDIUM),
+        ]
+        .spacing(6)
+        .align_y(Center),
+    )
+    .on_press(message)
+    .padding([6, 10])
+    .style(style::btn_solid)
+    .into()
+}
+
+fn secondary_action(
+    icon: &'static str,
+    label: &'static str,
+    message: Message,
+) -> Element<'static, Message> {
+    button(
+        row![
+            icons::icon(icon, 14.0, style::SLATE_500),
+            text(label).size(12).font(style::MEDIUM),
+        ]
+        .spacing(6)
+        .align_y(Center),
+    )
+    .on_press(message)
+    .padding([6, 10])
+    .style(style::btn_secondary)
+    .into()
+}
+
+fn cancel_button() -> Element<'static, Message> {
+    button(
+        text("Cancel")
+            .size(12)
+            .font(style::MEDIUM)
+            .style(style::text_danger),
+    )
+    .on_press(Message::CancelParse)
+    .padding([4, 10])
+    .style(style::btn_danger)
+    .into()
 }

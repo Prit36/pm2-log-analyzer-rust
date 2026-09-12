@@ -1,28 +1,26 @@
 //! `Toast` — port of `src/components/Toast.tsx`.
 
-use dioxus::prelude::*;
+use iced::widget::{container, text};
+use iced::{Bottom, Element, Fill, Padding, Right};
 
-use crate::store::{use_analysis_store, use_app_mode_store, AppMode};
+use crate::app::Message;
+use crate::ui::style;
 
-#[component]
-pub fn Toast() -> Element {
-    let store = use_analysis_store();
-    let app = use_app_mode_store();
-    let pm2_toast = store.toast();
-    let mongo_toast: Option<String> = None;
-    let toast = if app.mode() == AppMode::Mongo {
-        mongo_toast.or(pm2_toast)
-    } else {
-        pm2_toast.or(mongo_toast)
-    };
-    let Some(toast) = toast else {
-        return rsx! {};
-    };
-    rsx! {
-        div {
-            role: "status",
-            class: "fixed bottom-4 right-4 z-50 max-w-sm rounded-lg border border-slate-200 bg-slate-900 px-3.5 py-2.5 text-xs font-medium text-white shadow-xl dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100",
-            "{toast}"
-        }
-    }
+pub fn view(message: &str) -> Element<'_, Message> {
+    container(
+        container(text(message.to_string()).size(12).font(style::MEDIUM))
+            .padding(Padding {
+                top: 10.0,
+                right: 14.0,
+                bottom: 10.0,
+                left: 14.0,
+            })
+            .style(style::toast),
+    )
+    .width(Fill)
+    .height(Fill)
+    .align_x(Right)
+    .align_y(Bottom)
+    .padding(16)
+    .into()
 }

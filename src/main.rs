@@ -1,23 +1,29 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use dioxus::prelude::*;
-use dioxus_desktop::{Config, LogicalSize, WindowBuilder};
+use iced::window;
+use iced::Size;
+
 use pm2_log_analyzer::app::App;
 
-fn main() {
-    let window = WindowBuilder::new()
-        .with_title("PM2 Log Analyzer")
-        .with_inner_size(LogicalSize::new(1280.0, 850.0))
-        .with_min_inner_size(LogicalSize::new(900.0, 600.0))
-        .with_resizable(true);
+fn main() -> iced::Result {
+    let window = window::Settings {
+        size: Size::new(1280.0, 850.0),
+        min_size: Some(Size::new(900.0, 600.0)),
+        resizable: true,
+        ..window::Settings::default()
+    };
 
-    let mut config = Config::new().with_window(window);
-    // Test harness hook: isolated WebView2 storage per run (fresh localStorage).
-    if let Ok(dir) = std::env::var("PM2_ANALYZER_DATA_DIR") {
-        config = config.with_data_directory(std::path::PathBuf::from(dir));
+    let mut app = iced::application(App::boot, App::update, App::view)
+        .title(App::title)
+        .theme(App::theme)
+        .subscription(App::subscription)
+        .style(App::style)
+        .default_font(pm2_log_analyzer::ui::style::REGULAR)
+        .window(window);
+
+    for face in pm2_log_analyzer::ui::fonts::FILES {
+        app = app.font(face);
     }
 
-    LaunchBuilder::new()
-        .with_cfg(config)
-        .launch(App);
+    app.run()
 }

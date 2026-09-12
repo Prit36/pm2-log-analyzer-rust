@@ -91,6 +91,17 @@ pub fn format_num_i64(n: i64) -> String {
     }
 }
 
+/// `${value}x` — JS number formatting, i.e. the shortest round-trip form
+/// (`62.8x`, `110x`), which is exactly what Rust's `f64` `Display` produces.
+pub fn format_ratio(value: f64) -> String {
+    format!("{value}x")
+}
+
+/// `Math.round(value * 10) / 10` — the slow-query table's scan ratio.
+pub fn round_to_tenth(value: f64) -> f64 {
+    (value * 10.0).round() / 10.0
+}
+
 fn group_thousands(digits: &str) -> String {
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     let len = digits.len();

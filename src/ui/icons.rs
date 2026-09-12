@@ -2,7 +2,8 @@
 // Source: lucide-react v1.39.0 (ISC) via the reference app's node_modules.
 #![allow(dead_code)]
 
-use dioxus::prelude::*;
+use iced::widget::svg;
+use iced::{Color, ContentFit};
 
 /// Resolve a lucide-react import name to its canonical icon name.
 pub fn canonical(name: &str) -> &str {
@@ -64,23 +65,21 @@ pub fn svg_inner(name: &str) -> &'static str {
     }
 }
 
-#[component]
-pub fn Icon(name: String, class: String) -> Element {
-    let canonical_name = canonical(&name).to_string();
-    rsx! {
-        svg {
-            xmlns: "http://www.w3.org/2000/svg",
-            width: "24",
-            height: "24",
-            view_box: "0 0 24 24",
-            fill: "none",
-            stroke: "currentColor",
-            stroke_width: "2",
-            stroke_linecap: "round",
-            stroke_linejoin: "round",
-            class: "lucide lucide-{canonical_name} {class}",
-            "aria-hidden": "true",
-            dangerous_inner_html: svg_inner(&canonical_name),
-        }
-    }
+/// A self-contained SVG document for a lucide icon with the stroke color baked
+/// in, ready for the iced svg widget (which rasterizes through resvg and tints
+/// by replacing the RGB channels of non-transparent pixels).
+pub fn svg_document(name: &str, color: Color) -> String {
+    let [r, g, b, _] = color.into_rgba8();
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#{r:02x}{g:02x}{b:02x}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{}</svg>"##,
+        svg_inner(canonical(name))
+    )
+}
+
+/// A lucide icon drawn at a fixed square size.
+pub fn icon(name: &str, size: f32, color: Color) -> svg::Svg<'static> {
+    svg(svg::Handle::from_memory(svg_document(name, color).into_bytes()))
+        .width(size)
+        .height(size)
+        .content_fit(ContentFit::Fill)
 }

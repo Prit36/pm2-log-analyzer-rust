@@ -2,11 +2,11 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 [![Rust Edition](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
-[![GUI Framework](https://img.shields.io/badge/gui-egui--0.31-blue.svg)](https://github.com/emilk/egui)
+[![GUI Framework](https://img.shields.io/badge/gui-iced--0.14-blue.svg)](https://iced.rs)
 [![Target OS](https://img.shields.io/badge/platform-Windows%20x64-0078D6.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A high-throughput, native Windows desktop application for analyzing large-scale PM2 process log files. Built in Rust 2024 using `egui` and parallel memory-mapped I/O, it parses multi-gigabyte log files at **1.76 GB/s** throughput and renders interactive latency analytics dashboards in **< 3.5 seconds for a 5.22 GB log file (65 Million lines)**.
+A high-throughput, native Windows desktop application for analyzing large-scale PM2 process log files. Built in Rust 2024 using `iced` and parallel memory-mapped I/O, it parses multi-gigabyte log files at **1.76 GB/s** throughput and renders interactive latency analytics dashboards in **< 3.5 seconds for a 5.22 GB log file (65 Million lines)**.
 
 ---
 
@@ -90,7 +90,7 @@ All benchmarks were conducted on **Windows 11 x64 (12-Thread CPU)** using the re
                                           v
 +-----------------------------------------------------------------------------------+
 |                           Native User Interface                                   |
-|             - Immediate-mode UI (egui 0.31)                                       |
+|             - Native GPU UI (iced 0.14, wgpu)                                     |
 |             - Interactive KPI cards, endpoint tables, & latency charts            |
 +-----------------------------------------------------------------------------------+
 ```

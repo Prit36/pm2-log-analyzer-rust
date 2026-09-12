@@ -21,10 +21,9 @@ name = "parity_runner"
 path = "src/bin/parity_runner.rs"
 
 [dependencies]
-dioxus = { version = "0.6", features = ["desktop"] }
-dioxus-desktop = "0.6"
-tokio = { version = "1.40", features = ["rt-multi-thread", "time", "sync"] }
-arboard = "3.4"
+# `tokio` backend powers iced's task executor and timers; `svg` renders lucide icons
+# and the Recharts-parity chart documents through iced's resvg pipeline.
+iced = { version = "0.14", features = ["svg", "tokio"] }
 rayon = "1.12"
 memmap2 = "0.9"
 memchr = "2.8"
@@ -38,9 +37,13 @@ serde_json = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
 mimalloc = "0.1"
 resvg = { version = "0.48.1", default-features = false, features = ["text", "system-fonts"] }
+# Exact IBM Plex Mono metrics for `text_fit` truncation (same parser iced uses).
+tokio = { version = "1", default-features = false, features = ["time"] }
+ttf-parser = "0.25"
 
 [dev-dependencies]
 zip = "8.6"
+iced_test = "0.14"
 
 [profile.release]
 opt-level = 3

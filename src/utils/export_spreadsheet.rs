@@ -11,9 +11,9 @@ use rust_xlsxwriter::{
 };
 
 use crate::core::models::{AggregatedEndpoint, CronAggregated, HourlyBucket, LogSummary};
-use crate::store::{show_toast, AnalysisFilters, AnalysisStore, SortDirection};
+use crate::store::{AnalysisFilters, SortDirection};
 use crate::utils::chart_renderer;
-use crate::utils::format::{format_bytes, format_date, format_date_time, format_ms, format_num};
+use crate::utils::format::{format_date, format_date_time, format_ms, format_num};
 
 const MS_FMT: &str = "#,##0.0\" ms\"";
 const TABLE_HEADER_ROW: u32 = 4; // 1-based row of the table header (0-based index 3).
@@ -972,19 +972,8 @@ fn export_file_name() -> String {
     format!("pm2-analyzer-report-{ts}.xlsx")
 }
 
-fn build_source_label(store: &AnalysisStore) -> Option<String> {
-    use crate::store::SourceKind;
-    match store.source_kind() {
-        SourceKind::File => store.file_name().map(|name| match store.file_size() {
-            Some(size) => format!("{name} ({})", format_bytes(size)),
-            None => name,
-        }),
-        SourceKind::Paste => Some("Pasted text".to_string()),
-        _ => None,
-    }
-}
-
-fn save_target() -> Option<PathBuf> {
+/// Opens the Excel save dialog (or `PM2_ANALYZER_EXPORT_DIR` for tests).
+pub fn save_target() -> Option<PathBuf> {
     let name = export_file_name();
     if let Ok(dir) = std::env::var("PM2_ANALYZER_EXPORT_DIR") {
         return Some(PathBuf::from(dir).join(name));
@@ -995,47 +984,55 @@ fn save_target() -> Option<PathBuf> {
         .save_file()
 }
 
-pub fn export_spreadsheet_data(store: AnalysisStore) {
-    let result = store.result();
-    let filters = store.filters();
-    let (api, cron) = match &result {
-        Some(r) => (
-            filter_api_endpoints(&r.api, &filters.methods, &filters.query),
-            r.cron.clone(),
-        ),
-        None => (Vec::new(), Vec::new()),
-    };
-    if api.is_empty() && cron.is_empty() {
-        show_toast(store, "Nothing to export yet");
-        return;
+/// Everything a workbook export needs, detached from the live UI state so the
+/// workbook can be built on a worker thread.
+pub struct ExportData {
+    pub api: Vec<AggregatedEndpoint>,
+    pub cron: Vec<CronAggregated>,
+    pub hourly: Vec<HourlyBucket>,
+    pub daily: Vec<crate::core::models::DaySummary>,
+    pub summary: Option<LogSummary>,
+    pub filters: AnalysisFilters,
+    pub source_label: Option<String>,
+}
+
+impl ExportData {
+    /// Collects the filtered rows the reference exports, or `None` when there is
+    /// nothing to export.
+    pub fn collect(
+        result: Option<&crate::core::models::AggregatedResult>,
+        filters: &AnalysisFilters,
+        source_label: Option<String>,
+    ) -> Option<Self> {
+        let result = result?;
+        let api = filter_api_endpoints(&result.api, &filters.methods, &filters.query);
+        let cron = result.cron.clone();
+        if api.is_empty() && cron.is_empty() {
+            return None;
+        }
+        Some(Self {
+            api,
+            cron,
+            hourly: result.hourly_stats.clone(),
+            daily: result.daily_stats.clone(),
+            summary: Some(result.summary.clone()),
+            filters: filters.clone(),
+            source_label,
+        })
     }
-    let source_label = build_source_label(&store);
-    let input = ExportInput {
-        api: &api,
-        cron: &cron,
-        hourly: result.as_ref().map(|r| r.hourly_stats.as_slice()).unwrap_or(&[]),
-        daily: result.as_ref().map(|r| r.daily_stats.as_slice()).unwrap_or(&[]),
-        summary: result.as_ref().map(|r| &r.summary),
-        filters: &filters,
-        source_label: source_label.as_deref(),
-    };
-    let built = build_workbook(&input).and_then(|mut wb| {
-        let Some(path) = save_target() else {
-            return Err("cancelled".to_string());
+
+    /// Builds and saves the workbook to `path`.
+    pub fn write(&self, path: &std::path::Path) -> Result<(), String> {
+        let input = ExportInput {
+            api: &self.api,
+            cron: &self.cron,
+            hourly: &self.hourly,
+            daily: &self.daily,
+            summary: self.summary.as_ref(),
+            filters: &self.filters,
+            source_label: self.source_label.as_deref(),
         };
-        wb.save(&path).map_err(|e| e.to_string())
-    });
-    match built {
-        Ok(()) => show_toast(
-            store,
-            if !cron.is_empty() {
-                "Excel downloaded — Visual Analytics + Data sheets"
-            } else {
-                "Excel downloaded — Visual Analytics + API sheets"
-            },
-        ),
-        Err(msg) if msg == "cancelled" => {}
-        Err(_) => show_toast(store, "Excel export failed"),
+        write_export(&input, path)
     }
 }
 
@@ -1043,8 +1040,4 @@ pub fn export_spreadsheet_data(store: AnalysisStore) {
 pub fn write_export(input: &ExportInput, path: &std::path::Path) -> Result<(), String> {
     let mut wb = build_workbook(input)?;
     wb.save(path).map_err(|e| e.to_string())
-}
-
-pub fn export_mongo_spreadsheet_placeholder(store: AnalysisStore) {
-    show_toast(store, "Export is not wired yet");
 }

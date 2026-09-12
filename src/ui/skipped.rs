@@ -1,44 +1,109 @@
 //! `SkippedDisclosure` — port of `src/components/SkippedDisclosure.tsx`.
 
-use dioxus::prelude::*;
+use iced::widget::{button, column, container, row, scrollable, text};
+use iced::{Center, Element, Fill, Length, Padding};
 
-use crate::store::use_analysis_store;
+use crate::app::{App, Message};
+use crate::ui::{icons, style};
 use crate::utils::format::format_num;
 
-#[component]
-pub fn SkippedDisclosure() -> Element {
-    let store = use_analysis_store();
-    if !store.has_data() {
-        return rsx! {};
+const SAMPLE_ROW_HEIGHT: f32 = 18.0;
+
+pub fn view(app: &App) -> Option<Element<'_, Message>> {
+    if !app.analysis.has_data {
+        return None;
     }
-    let Some(result) = store.result() else {
-        return rsx! {};
-    };
-    let unmatched_count = result.unmatched_count;
-    if unmatched_count == 0 {
-        return rsx! {};
+    let result = app.analysis.result.as_ref()?;
+    if result.unmatched_count == 0 {
+        return None;
     }
-    let sample = result.unmatched_sample;
-    rsx! {
-        details { class: "rounded border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900",
-            summary { class: "cursor-pointer px-3 py-2 text-xs font-medium text-slate-600 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800",
-                "{format_num(unmatched_count)} lines skipped"
-                span { class: "ml-2 font-normal text-slate-400 dark:text-slate-500",
-                    "(non-HTTP / unmatched)"
-                }
-            }
-            div { class: "border-t border-slate-100 px-3 py-2 dark:border-slate-800",
-                ul { class: "max-h-48 space-y-1 overflow-auto font-mono-data text-[11px] text-slate-600 dark:text-slate-400",
-                    for (i, line) in sample.iter().enumerate() {
-                        li { key: "{i}", class: "truncate", title: "{line}", "{line}" }
-                    }
-                }
-                if unmatched_count > sample.len() as u64 {
-                    p { class: "mt-2 text-[11px] text-slate-400 dark:text-slate-500",
-                        "Showing {sample.len()} of {format_num(unmatched_count)} samples"
-                    }
-                }
-            }
+
+    let is_dark = app.analysis.is_dark();
+    let sample = &result.unmatched_sample;
+    let summary = row![
+        text(format!("{} lines skipped", format_num(result.unmatched_count)))
+            .size(12)
+            .font(style::MEDIUM)
+            .style(style::text_muted),
+        text("(non-HTTP / unmatched)")
+            .size(12)
+            .style(style::text_faint),
+    ]
+    .spacing(8)
+    .align_y(Center);
+
+    let toggle = button(
+        row![
+            icons::icon(
+                if app.skipped_open {
+                    "arrow-down"
+                } else {
+                    "arrow-right"
+                },
+                12.0,
+                if is_dark {
+                    style::SLATE_400
+                } else {
+                    style::SLATE_500
+                },
+            ),
+            summary,
+        ]
+        .spacing(6)
+        .align_y(Center),
+    )
+    .on_press(Message::ToggleSkipped)
+    .padding([8, 12])
+    .width(Fill)
+    .style(style::transparent_button);
+
+    let mut body = column![].spacing(0).width(Fill);
+    if app.skipped_open {
+        let list_height = (sample.len() as f32 * SAMPLE_ROW_HEIGHT).min(192.0);
+        let mut lines = column![].spacing(2).width(Fill);
+        for line in sample {
+            lines = lines.push(
+                text(line.clone())
+                    .size(11)
+                    .font(style::MONO)
+                    .style(style::text_muted),
+            );
+        }
+        body = body.push(
+            container(scrollable(lines).height(Length::Fixed(list_height)))
+                .padding(Padding {
+                    top: 8.0,
+                    right: 12.0,
+                    bottom: 8.0,
+                    left: 12.0,
+                })
+                .width(Fill),
+        );
+        if result.unmatched_count > sample.len() as u64 {
+            body = body.push(
+                container(
+                    text(format!(
+                        "Showing {} of {} samples",
+                        sample.len(),
+                        format_num(result.unmatched_count)
+                    ))
+                    .size(11)
+                    .style(style::text_faint),
+                )
+                .padding(Padding {
+                    top: 0.0,
+                    right: 12.0,
+                    bottom: 10.0,
+                    left: 12.0,
+                }),
+            );
         }
     }
+
+    Some(
+        container(column![toggle, body].spacing(0))
+            .width(Fill)
+            .style(style::card)
+            .into(),
+    )
 }

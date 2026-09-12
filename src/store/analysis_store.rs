@@ -1,22 +1,20 @@
-//! PM2 analysis store — mirrors `src/store/analysisStore.ts` (Zustand) and the
+//! PM2 analysis state — mirrors `src/store/analysisStore.ts` (Zustand) and the
 //! module-level actions in `src/hooks/useParserWorker.ts`.
+//!
+//! Plain data plus synchronous transitions; asynchronous orchestration (parse
+//! jobs, reaggregation) lives in [`crate::app`].
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::core::models::{AggregatedResult, NormalizeMode, ParseOptions, StatusFamily};
-use crate::core::pm2::{
-    parse_sources, LoadedSource, JobControl, ParseError, Pm2Kernel,
-};
+use crate::core::pm2::{JobControl, LoadedSource, Pm2Kernel};
 use crate::utils::persist;
-use crate::utils::format::format_num;
 
 pub const PASTE_WARN_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_TOP_N: usize = 50;
-const TOAST_MS: u64 = 3200;
+pub const TOAST_MS: u64 = 3200;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -135,6 +133,203 @@ pub struct ParseProgress {
     pub percent: u32,
 }
 
+/// All analysis state shared by the UI, matching the Zustand reference store.
+pub struct AnalysisState {
+    pub theme: Theme,
+    pub chart_layout: ChartLayout,
+    pub source_kind: SourceKind,
+    pub file_name: Option<String>,
+    pub file_names: Vec<String>,
+    pub file_size: Option<u64>,
+    pub loaded_files: Vec<LoadedSource>,
+    pub has_data: bool,
+    pub result: Option<AggregatedResult>,
+    pub is_parsing: bool,
+    pub progress: Option<ParseProgress>,
+    pub error: Option<String>,
+    pub filters: AnalysisFilters,
+    pub toast: Option<String>,
+    pub toast_epoch: u64,
+    pub paste_open: bool,
+    pub kernel: Option<Arc<Mutex<Pm2Kernel>>>,
+    pub job: Option<Arc<JobControl>>,
+}
+
+impl AnalysisState {
+    pub fn new() -> Self {
+        Self {
+            theme: Theme::Light,
+            chart_layout: ChartLayout::Split,
+            source_kind: SourceKind::None,
+            file_name: None,
+            file_names: Vec::new(),
+            file_size: None,
+            loaded_files: Vec::new(),
+            has_data: false,
+            result: None,
+            is_parsing: false,
+            progress: None,
+            error: None,
+            filters: AnalysisFilters::default(),
+            toast: None,
+            toast_epoch: 0,
+            paste_open: false,
+            kernel: None,
+            job: None,
+        }
+    }
+
+    pub fn is_dark(&self) -> bool {
+        self.theme == Theme::Dark
+    }
+
+    pub fn summary(&self) -> Option<crate::core::models::LogSummary> {
+        self.result.as_ref().map(|r| r.summary.clone())
+    }
+
+    pub fn has_cron_events(&self) -> bool {
+        self.result
+            .as_ref()
+            .map(|r| {
+                let c = &r.cron_summary;
+                c.starts + c.dones + c.fails > 0
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn show_toast(&mut self, message: impl Into<String>) {
+        self.toast_epoch += 1;
+        self.toast = Some(message.into());
+    }
+
+    pub fn clear_toast(&mut self) {
+        self.toast = None;
+    }
+
+    pub fn set_result(&mut self, result: AggregatedResult) {
+        let cron = result.cron_summary.clone();
+        self.has_data = result.summary.matched > 0
+            || cron.starts + cron.dones + cron.fails > 0
+            || result.unmatched_count > 0;
+        self.result = Some(result);
+    }
+
+    pub fn clear(&mut self) {
+        if let Some(job) = &self.job {
+            job.cancel();
+        }
+        self.source_kind = SourceKind::None;
+        self.file_name = None;
+        self.file_names = Vec::new();
+        self.file_size = None;
+        self.loaded_files = Vec::new();
+        self.has_data = false;
+        self.result = None;
+        self.progress = None;
+        self.error = None;
+        self.is_parsing = false;
+        self.paste_open = false;
+        self.kernel = None;
+        self.job = None;
+    }
+
+    /// Cancel the running parse; a late finish is ignored by job identity.
+    pub fn cancel(&mut self) {
+        if let Some(job) = &self.job {
+            job.cancel();
+        }
+        self.is_parsing = false;
+    }
+
+    /// Replace the loaded file set (`setLoadedFiles` parity).
+    pub fn set_loaded_files(&mut self, files: Vec<LoadedSource>) -> Vec<LoadedSource> {
+        let total = files.len();
+        let mut seen: Vec<u64> = Vec::new();
+        let mut unique: Vec<LoadedSource> = Vec::new();
+        for file in files {
+            let size = file.size();
+            if !seen.contains(&size) {
+                seen.push(size);
+                unique.push(file);
+            }
+        }
+        let skipped = total - unique.len();
+        if skipped > 0 {
+            self.show_toast(format!(
+                "Skipped {skipped} duplicate file{} (identical file size)",
+                if skipped > 1 { "s" } else { "" }
+            ));
+        }
+        self.source_kind = SourceKind::File;
+        self.file_name = applied_display_name(&unique);
+        self.file_names = unique.iter().map(|f| f.name()).collect();
+        self.file_size = Some(total_size(&unique));
+        self.loaded_files = unique.clone();
+        self.paste_open = false;
+        unique
+    }
+
+    /// Append to the loaded file set (`appendLoadedFiles` parity).
+    pub fn append_loaded_files(&mut self, files: Vec<LoadedSource>) -> Vec<LoadedSource> {
+        let total_incoming = files.len();
+        let mut seen: Vec<u64> = self.loaded_files.iter().map(|f| f.size()).collect();
+        let mut unique_new: Vec<LoadedSource> = Vec::new();
+        for file in files {
+            let size = file.size();
+            if !seen.contains(&size) {
+                seen.push(size);
+                unique_new.push(file);
+            }
+        }
+        if unique_new.is_empty() {
+            self.show_toast("All selected files are already loaded (identical file size)");
+            return self.loaded_files.clone();
+        }
+        let skipped = total_incoming - unique_new.len();
+        if skipped > 0 {
+            self.show_toast(format!(
+                "Skipped {skipped} duplicate file{} (already loaded with same size)",
+                if skipped > 1 { "s" } else { "" }
+            ));
+        }
+        self.loaded_files.extend(unique_new);
+        self.source_kind = SourceKind::File;
+        self.file_name = applied_display_name(&self.loaded_files);
+        self.file_names = self.loaded_files.iter().map(|f| f.name()).collect();
+        self.file_size = Some(total_size(&self.loaded_files));
+        self.paste_open = false;
+        self.loaded_files.clone()
+    }
+
+    pub fn set_source_paste(&mut self) {
+        self.source_kind = SourceKind::Paste;
+        self.file_name = None;
+        self.file_names = Vec::new();
+        self.file_size = None;
+        self.loaded_files = Vec::new();
+    }
+}
+
+impl Default for AnalysisState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn total_size(files: &[LoadedSource]) -> u64 {
+    files.iter().map(|f| f.size()).sum()
+}
+
+fn applied_display_name(files: &[LoadedSource]) -> Option<String> {
+    match files.len() {
+        0 => None,
+        1 => Some(files[0].name()),
+        n => Some(format!("{n} log files ({}, ...)", files[0].name())),
+    }
+}
+
+// ── Persistence ─────────────────────────────────────────────────────────────
+
 #[derive(Serialize, Deserialize)]
 struct PersistedState {
     filters: AnalysisFilters,
@@ -149,166 +344,6 @@ struct PersistedEnvelope {
     version: u32,
 }
 
-#[derive(Clone, Copy)]
-pub struct AnalysisStore {
-    pub theme: Signal<Theme>,
-    pub chart_layout: Signal<ChartLayout>,
-    pub source_kind: Signal<SourceKind>,
-    pub file_name: Signal<Option<String>>,
-    pub file_names: Signal<Vec<String>>,
-    pub file_size: Signal<Option<u64>>,
-    pub loaded_files: Signal<Vec<LoadedSource>>,
-    pub has_data: Signal<bool>,
-    pub result: Signal<Option<AggregatedResult>>,
-    pub is_parsing: Signal<bool>,
-    pub progress: Signal<Option<ParseProgress>>,
-    pub error: Signal<Option<String>>,
-    pub filters: Signal<AnalysisFilters>,
-    pub toast: Signal<Option<String>>,
-    pub paste_open: Signal<bool>,
-    pub kernel: Signal<Option<Arc<Mutex<Pm2Kernel>>>>,
-    pub job: Signal<Option<Arc<JobControl>>>,
-    pub toast_epoch: Signal<u64>,
-    pub reagg_epoch: Signal<u64>,
-    pub window_width: Signal<f64>,
-}
-
-impl AnalysisStore {
-    pub fn new() -> Self {
-        Self {
-            theme: Signal::new(Theme::Light),
-            chart_layout: Signal::new(ChartLayout::Split),
-            source_kind: Signal::new(SourceKind::None),
-            file_name: Signal::new(None),
-            file_names: Signal::new(Vec::new()),
-            file_size: Signal::new(None),
-            loaded_files: Signal::new(Vec::new()),
-            has_data: Signal::new(false),
-            result: Signal::new(None),
-            is_parsing: Signal::new(false),
-            progress: Signal::new(None),
-            error: Signal::new(None),
-            filters: Signal::new(AnalysisFilters::default()),
-            toast: Signal::new(None),
-            paste_open: Signal::new(false),
-            kernel: Signal::new(None),
-            job: Signal::new(None),
-            toast_epoch: Signal::new(0),
-            reagg_epoch: Signal::new(0),
-            window_width: Signal::new(1440.0),
-        }
-    }
-
-    pub fn is_dark(&self) -> bool {
-        (self.theme)() == Theme::Dark
-    }
-
-    pub fn theme(&self) -> Theme {
-        (self.theme)()
-    }
-
-    pub fn chart_layout(&self) -> ChartLayout {
-        (self.chart_layout)()
-    }
-
-    pub fn source_kind(&self) -> SourceKind {
-        (self.source_kind)()
-    }
-
-    pub fn file_name(&self) -> Option<String> {
-        (self.file_name)()
-    }
-
-    pub fn file_names(&self) -> Vec<String> {
-        (self.file_names)()
-    }
-
-    pub fn file_size(&self) -> Option<u64> {
-        (self.file_size)()
-    }
-
-    pub fn loaded_files(&self) -> Vec<LoadedSource> {
-        (self.loaded_files)()
-    }
-
-    pub fn has_data(&self) -> bool {
-        (self.has_data)()
-    }
-
-    pub fn result(&self) -> Option<AggregatedResult> {
-        (self.result)()
-    }
-
-    pub fn is_parsing(&self) -> bool {
-        (self.is_parsing)()
-    }
-
-    pub fn progress(&self) -> Option<ParseProgress> {
-        (self.progress)()
-    }
-
-    pub fn error(&self) -> Option<String> {
-        (self.error)()
-    }
-
-    pub fn filters(&self) -> AnalysisFilters {
-        (self.filters)()
-    }
-
-    pub fn toast(&self) -> Option<String> {
-        (self.toast)()
-    }
-
-    pub fn paste_open(&self) -> bool {
-        (self.paste_open)()
-    }
-
-    pub fn kernel(&self) -> Option<Arc<Mutex<Pm2Kernel>>> {
-        (self.kernel)()
-    }
-
-    pub fn job(&self) -> Option<Arc<JobControl>> {
-        (self.job)()
-    }
-
-    pub fn toast_epoch(&self) -> u64 {
-        (self.toast_epoch)()
-    }
-
-    pub fn reagg_epoch(&self) -> u64 {
-        (self.reagg_epoch)()
-    }
-
-    pub fn window_width(&self) -> f64 {
-        (self.window_width)()
-    }
-
-    pub fn summary(&self) -> Option<crate::core::models::LogSummary> {
-        self.result().map(|r| r.summary)
-    }
-
-    pub fn has_cron_events(&self) -> bool {
-        self.result()
-            .map(|r| {
-                let c = r.cron_summary;
-                c.starts + c.dones + c.fails > 0
-            })
-            .unwrap_or(false)
-    }
-}
-
-impl Default for AnalysisStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub fn use_analysis_store() -> AnalysisStore {
-    use_context::<AnalysisStore>()
-}
-
-// ── Persistence ─────────────────────────────────────────────────────────────
-
 pub fn persisted_json(filters: &AnalysisFilters, theme: Theme, chart_layout: ChartLayout) -> String {
     let envelope = PersistedEnvelope {
         state: PersistedState {
@@ -321,84 +356,24 @@ pub fn persisted_json(filters: &AnalysisFilters, theme: Theme, chart_layout: Cha
     serde_json::to_string(&envelope).unwrap_or_default()
 }
 
-pub fn persist(store: AnalysisStore) {
-    let json = persisted_json(&store.filters(), store.theme(), store.chart_layout());
+pub fn persist(state: &AnalysisState) {
+    let json = persisted_json(&state.filters, state.theme, state.chart_layout);
     persist::set_item("pm2-analyzer-filters", &json);
 }
 
-/// Track window size for chart layout math (single eval listener; no polling).
-pub async fn install_window_size(mut store: AnalysisStore) {
-    let mut eval = document::eval(
-        "dioxus.send(window.innerWidth);
-         window.addEventListener('resize', () => dioxus.send(window.innerWidth));",
-    );
-    while let Ok(width) = eval.recv::<f64>().await {
-        store.window_width.set(width);
-    }
-}
-
-/// Load persisted filters/theme/layout at startup (async, once).
-pub async fn restore_persisted(mut store: AnalysisStore) {
-    if let Some(raw) = persist::load_item("pm2-analyzer-filters").await {
-        if let Ok(envelope) = serde_json::from_str::<PersistedEnvelope>(&raw) {
-            store.filters.set(envelope.state.filters);
-            store.theme.set(envelope.state.theme);
-            store.chart_layout.set(envelope.state.chart_layout);
-        }
-    }
-    persist::set_html_dark(store.theme() == Theme::Dark);
-}
-
-// ── Theme / layout ──────────────────────────────────────────────────────────
-
-pub fn toggle_theme(mut store: AnalysisStore) {
-    let next = if store.theme() == Theme::Dark {
-        Theme::Light
-    } else {
-        Theme::Dark
+/// Load persisted filters/theme/layout, restoring them into `state`.
+pub fn restore_persisted(state: &mut AnalysisState) {
+    let Some(raw) = persist::load_item("pm2-analyzer-filters") else {
+        return;
     };
-    store.theme.set(next);
-    persist::set_html_dark(next == Theme::Dark);
-    persist(store);
-}
-
-pub fn toggle_chart_layout(mut store: AnalysisStore) {
-    let next = if store.chart_layout() == ChartLayout::Split {
-        ChartLayout::Wide
-    } else {
-        ChartLayout::Split
-    };
-    store.chart_layout.set(next);
-    persist(store);
-}
-
-// ── Toast ───────────────────────────────────────────────────────────────────
-
-pub fn show_toast(mut store: AnalysisStore, message: impl Into<String>) {
-    let message = message.into();
-    let epoch = store.toast_epoch() + 1;
-    store.toast_epoch.set(epoch);
-    store.toast.set(Some(message));
-    spawn(async move {
-        tokio::time::sleep(Duration::from_millis(TOAST_MS)).await;
-        if store.toast_epoch() == epoch {
-            store.toast.set(None);
-        }
-    });
+    if let Ok(envelope) = serde_json::from_str::<PersistedEnvelope>(&raw) {
+        state.filters = envelope.state.filters;
+        state.theme = envelope.state.theme;
+        state.chart_layout = envelope.state.chart_layout;
+    }
 }
 
 // ── Filters ─────────────────────────────────────────────────────────────────
-
-pub fn set_filters(mut store: AnalysisStore, filters: AnalysisFilters) {
-    store.filters.set(filters);
-    persist(store);
-}
-
-pub fn reset_filters(mut store: AnalysisStore) {
-    store.filters.set(AnalysisFilters::default());
-    persist(store);
-    reaggregate(store);
-}
 
 pub fn count_active_analysis_filters(filters: &AnalysisFilters) -> usize {
     let mut count = 0;
@@ -454,285 +429,4 @@ pub fn parse_options(filters: &AnalysisFilters) -> ParseOptions {
             Some(filters.date_filter.clone())
         },
     }
-}
-
-// ── Result plumbing ─────────────────────────────────────────────────────────
-
-fn set_result(mut store: AnalysisStore, result: AggregatedResult) {
-    let cron = result.cron_summary.clone();
-    let has_data = result.summary.matched > 0
-        || cron.starts + cron.dones + cron.fails > 0
-        || result.unmatched_count > 0;
-    store.result.set(Some(result));
-    store.has_data.set(has_data);
-}
-
-pub fn clear_analysis(mut store: AnalysisStore) {
-    store.source_kind.set(SourceKind::None);
-    store.file_name.set(None);
-    store.file_names.set(Vec::new());
-    store.file_size.set(None);
-    store.loaded_files.set(Vec::new());
-    store.has_data.set(false);
-    store.result.set(None);
-    store.progress.set(None);
-    store.error.set(None);
-    store.is_parsing.set(false);
-    store.paste_open.set(false);
-    store.kernel.set(None);
-    store.job.set(None);
-}
-
-pub fn clear(store: AnalysisStore) {
-    if let Some(job) = store.job() {
-        job.cancel();
-    }
-    clear_analysis(store);
-}
-
-pub fn cancel(mut store: AnalysisStore) {
-    if let Some(job) = store.job() {
-        job.cancel();
-    }
-    store.is_parsing.set(false);
-}
-
-// ── Source selection (setLoadedFiles / appendLoadedFiles parity) ────────────
-
-fn total_size(files: &[LoadedSource]) -> u64 {
-    files.iter().map(|f| f.size()).sum()
-}
-
-fn applied_display_name(files: &[LoadedSource]) -> Option<String> {
-    match files.len() {
-        0 => None,
-        1 => Some(files[0].name()),
-        n => Some(format!("{n} log files ({}, ...)", files[0].name())),
-    }
-}
-
-pub fn set_loaded_files(mut store: AnalysisStore, files: Vec<LoadedSource>) -> Vec<LoadedSource> {
-    let total = files.len();
-    let mut seen: Vec<u64> = Vec::new();
-    let mut unique: Vec<LoadedSource> = Vec::new();
-    for file in files {
-        let size = file.size();
-        if !seen.contains(&size) {
-            seen.push(size);
-            unique.push(file);
-        }
-    }
-    let skipped = total - unique.len();
-    if skipped > 0 {
-        show_toast(
-            store,
-            format!(
-                "Skipped {skipped} duplicate file{} (identical file size)",
-                if skipped > 1 { "s" } else { "" }
-            ),
-        );
-    }
-    store.source_kind.set(SourceKind::File);
-    store.file_name.set(applied_display_name(&unique));
-    store.file_names.set(unique.iter().map(|f| f.name()).collect());
-    store.file_size.set(Some(total_size(&unique)));
-    store.loaded_files.set(unique.clone());
-    store.paste_open.set(false);
-    unique
-}
-
-pub fn append_loaded_files(mut store: AnalysisStore, files: Vec<LoadedSource>) -> Vec<LoadedSource> {
-    let total_incoming = files.len();
-    let existing = store.loaded_files();
-    let mut seen: Vec<u64> = existing.iter().map(|f| f.size()).collect();
-    let mut unique_new: Vec<LoadedSource> = Vec::new();
-    for file in files {
-        let size = file.size();
-        if !seen.contains(&size) {
-            seen.push(size);
-            unique_new.push(file);
-        }
-    }
-    if unique_new.is_empty() {
-        show_toast(
-            store,
-            "All selected files are already loaded (identical file size)",
-        );
-        return existing;
-    }
-    let skipped = total_incoming - unique_new.len();
-    if skipped > 0 {
-        show_toast(
-            store,
-            format!(
-                "Skipped {skipped} duplicate file{} (already loaded with same size)",
-                if skipped > 1 { "s" } else { "" }
-            ),
-        );
-    }
-    let mut combined = existing;
-    combined.extend(unique_new);
-    store.source_kind.set(SourceKind::File);
-    store.file_name.set(applied_display_name(&combined));
-    store.file_names.set(combined.iter().map(|f| f.name()).collect());
-    store.file_size.set(Some(total_size(&combined)));
-    store.loaded_files.set(combined.clone());
-    store.paste_open.set(false);
-    combined
-}
-
-pub fn set_source_paste(mut store: AnalysisStore) {
-    store.source_kind.set(SourceKind::Paste);
-    store.file_name.set(None);
-    store.file_names.set(Vec::new());
-    store.file_size.set(None);
-    store.loaded_files.set(Vec::new());
-}
-
-// ── Parse / reaggregate ─────────────────────────────────────────────────────
-
-pub fn handle_log_files_upload(store: AnalysisStore, files: Vec<LoadedSource>, append: bool) {
-    if files.is_empty() {
-        return;
-    }
-    let sources = if append {
-        append_loaded_files(store, files)
-    } else {
-        set_loaded_files(store, files)
-    };
-    if sources.is_empty() {
-        return;
-    }
-    run_parse(store, sources);
-}
-
-pub fn parse_text(store: AnalysisStore, text: String) {
-    let bytes = text.into_bytes();
-    let source = LoadedSource::Memory {
-        name: "paste".to_string(),
-        bytes: Arc::new(bytes),
-    };
-    set_source_paste(store);
-    run_parse(store, vec![source]);
-}
-
-fn run_parse(mut store: AnalysisStore, sources: Vec<LoadedSource>) {
-    let total = total_size(&sources);
-    let control = Arc::new(JobControl::new(total));
-    store.job.set(Some(control.clone()));
-    store.is_parsing.set(true);
-    store.error.set(None);
-    store.progress.set(Some(ParseProgress {
-        stage: "parsing".to_string(),
-        processed: 0,
-        total,
-        percent: 0,
-    }));
-
-    let mode = store.filters().normalize_mode;
-    let opts = parse_options(&store.filters());
-    let source_count = sources.len();
-
-    spawn(async move {
-        let control_bg = control.clone();
-        let mut handle = tokio::task::spawn_blocking(move || {
-            parse_sources(&sources, mode, &control_bg)
-        });
-        let started = std::time::Instant::now();
-        loop {
-            tokio::select! {
-                res = &mut handle => {
-                    if control.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                        return;
-                    }
-                    match res {
-                        Ok(Ok(mut kernel)) => {
-                            let elapsed = started.elapsed().as_millis() as u64;
-                            let summary_result = kernel.reaggregate(&opts);
-                            let matched = summary_result.summary.matched;
-                            store.kernel.set(Some(Arc::new(Mutex::new(kernel))));
-                            set_result(store, summary_result);
-                            store.progress.set(Some(ParseProgress {
-                                stage: "complete".to_string(),
-                                processed: total,
-                                total,
-                                percent: 100,
-                            }));
-                            store.is_parsing.set(false);
-                            if source_count > 1 {
-                                show_toast(
-                                    store,
-                                    format!(
-                                        "Parsed {} requests across {} files in {}ms",
-                                        format_num(matched),
-                                        source_count,
-                                        elapsed
-                                    ),
-                                );
-                            } else {
-                                show_toast(
-                                    store,
-                                    format!(
-                                        "Parsed {} requests in {}ms",
-                                        format_num(matched),
-                                        elapsed
-                                    ),
-                                );
-                            }
-                        }
-                        Ok(Err(err)) => {
-                            finish_parse_error(store, err);
-                        }
-                        Err(join_err) => {
-                            finish_parse_error(store, ParseError::Io(join_err.to_string()));
-                        }
-                    }
-                    return;
-                }
-                _ = tokio::time::sleep(Duration::from_millis(120)) => {
-                    store.progress.set(Some(ParseProgress {
-                        stage: "parsing".to_string(),
-                        processed: control.processed.load(std::sync::atomic::Ordering::Relaxed),
-                        total,
-                        percent: control.percent(),
-                    }));
-                }
-            }
-        }
-    });
-}
-
-fn finish_parse_error(mut store: AnalysisStore, err: ParseError) {
-    if matches!(err, ParseError::Cancelled) {
-        return;
-    }
-    let message = err.to_string();
-    store.error.set(Some(message.clone()));
-    store.is_parsing.set(false);
-    show_toast(store, message);
-}
-
-pub fn reaggregate(mut store: AnalysisStore) {
-    if store.is_parsing() {
-        return;
-    }
-    let Some(kernel) = store.kernel() else {
-        set_result(store, crate::core::models::EMPTY_RESULT);
-        return;
-    };
-    let opts = parse_options(&store.filters());
-    let epoch = store.reagg_epoch() + 1;
-    store.reagg_epoch.set(epoch);
-    spawn(async move {
-        let res = tokio::task::spawn_blocking(move || {
-            let mut guard = kernel.lock().expect("kernel lock");
-            guard.reaggregate(&opts)
-        })
-        .await;
-        if let Ok(result) = res {
-            if store.reagg_epoch() == epoch {
-                set_result(store, result);
-            }
-        }
-    });
 }

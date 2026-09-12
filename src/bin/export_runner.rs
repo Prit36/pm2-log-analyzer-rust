@@ -1,20 +1,28 @@
 //! Excel export runner — builds the same workbook the app produces, for parity comparison
 //! against the reference browser export.
 //!
-//! Usage: export_runner <log-file> <out.xlsx> [--charts-dir DIR]
+//! Usage: export_runner <log-file> <out.xlsx> [--charts-dir DIR] [--mongo]
 
 use std::path::PathBuf;
 
+use pm2_log_analyzer::core::mongo::parse_paths as parse_mongo_paths;
+use pm2_log_analyzer::core::mongo_models::MongoFilters;
 use pm2_log_analyzer::core::models::{NormalizeMode, ParseOptions};
+use pm2_log_analyzer::core::pm2::LoadedSource;
 use pm2_log_analyzer::core::pm2::{parse_paths, JobControl};
 use pm2_log_analyzer::store::AnalysisFilters;
+use pm2_log_analyzer::utils::export_mongo_spreadsheet;
 use pm2_log_analyzer::utils::export_spreadsheet::{write_export, ExportInput};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
-        eprintln!("usage: export_runner <log-file> <out.xlsx> [--charts-dir DIR]");
+        eprintln!("usage: export_runner <log-file> <out.xlsx> [--charts-dir DIR] [--mongo]");
         std::process::exit(2);
+    }
+    if args.iter().any(|arg| arg == "--mongo") {
+        export_mongo(&args);
+        return;
     }
     let log_path = PathBuf::from(&args[0]);
     let out_path = PathBuf::from(&args[1]);
@@ -69,4 +77,28 @@ fn main() {
             }
         }
     }
+}
+
+/// `--mongo`: parse a mongod log and write the MongoDB workbook.
+fn export_mongo(args: &[String]) {
+    let log_path = PathBuf::from(&args[0]);
+    let out_path = PathBuf::from(&args[1]);
+    let control = JobControl::new(0);
+    let kernel = parse_mongo_paths(&[LoadedSource::Path(log_path.clone())], &control)
+        .expect("mongo parse failed");
+    let result = kernel.reaggregate(&MongoFilters::default());
+    let label = log_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    export_mongo_spreadsheet::write_export(&result, label.as_deref(), &out_path)
+        .expect("export failed");
+    println!(
+        "wrote {} ({} patterns, {} slow queries, {} collections, {} errors, {} users)",
+        out_path.display(),
+        result.patterns.len(),
+        result.slow_queries.len(),
+        result.collections.len(),
+        result.errors.len(),
+        result.users.len()
+    );
 }

@@ -168,9 +168,3 @@ pub fn build_cron_tsv(rows: &[CronAggregated]) -> String {
     }
     lines.join("\r\n")
 }
-
-pub fn copy_to_clipboard(text: &str) -> bool {
-    arboard::Clipboard::new()
-        .and_then(|mut ctx| ctx.set_text(text.to_string()))
-        .is_ok()
-}

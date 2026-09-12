@@ -1,371 +1,332 @@
 //! `FilterBar` — port of `src/components/FilterBar.tsx`.
 
-use dioxus::prelude::*;
+use std::fmt;
 
+use iced::widget::{button, column, container, pick_list, row, space, text, text_input, Column};
+use iced::{Center, Element, Fill, Length, Padding};
+
+use crate::app::{App, Message, SEARCH_INPUT_ID};
 use crate::core::models::{NormalizeMode, StatusFamily};
-use crate::store::{
-    count_active_analysis_filters, reaggregate, reset_filters, set_filters, use_analysis_store,
-    AnalysisFilters, ApiSortKey, SortDirection,
-};
-use crate::utils::cn::cn;
+use crate::store::analysis_store::{count_active_analysis_filters, ApiSortKey};
+use crate::ui::{icons, style};
 use crate::utils::format::format_date;
 
-const FIELD_CLASS: &str = "rounded border border-slate-200 bg-white px-2 py-1.5 text-xs text-slate-800 focus:border-blue-500 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100 dark:focus:border-blue-400";
+const FIELD_PADDING: Padding = Padding {
+    top: 7.0,
+    right: 8.0,
+    bottom: 7.0,
+    left: 8.0,
+};
 
-pub const FILTER_SEARCH_KEY_SCRIPT: &str = r#"
-window.addEventListener('keydown', function (e) {
-  if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
-  const t = e.target;
-  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-  const input = document.querySelector('input[data-filter-search]');
-  if (input) { e.preventDefault(); input.focus(); }
-});
-"#;
-
-#[component]
-pub fn FilterBar() -> Element {
-    let store = use_analysis_store();
-    if !store.has_data() {
-        return rsx! {};
+impl fmt::Display for NormalizeMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            NormalizeMode::CollapseIds => "Collapse IDs",
+            NormalizeMode::StripQuery => "Strip query",
+            NormalizeMode::Exact => "Exact path",
+        })
     }
-    let filters = store.filters();
-    let active_count = count_active_analysis_filters(&filters);
-    let methods = store.result().map(|r| r.methods).unwrap_or_default();
-    let dates = store.result().map(|r| r.dates).unwrap_or_default();
+}
+
+impl fmt::Display for StatusFamily {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            StatusFamily::All => "All",
+            StatusFamily::X2xx => "2xx",
+            StatusFamily::X3xx => "3xx",
+            StatusFamily::X4xx => "4xx",
+            StatusFamily::X5xx => "5xx",
+        })
+    }
+}
+
+impl fmt::Display for ApiSortKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ApiSortKey::P95Ms => "p95",
+            ApiSortKey::P99Ms => "p99",
+            ApiSortKey::AvgMs => "avg",
+            ApiSortKey::MaxMs => "max",
+            ApiSortKey::Count => "count",
+            ApiSortKey::ErrorCount => "errors",
+            ApiSortKey::Path => "endpoint",
+        })
+    }
+}
+
+const NORMALIZE_OPTIONS: &[NormalizeMode] = &[
+    NormalizeMode::CollapseIds,
+    NormalizeMode::StripQuery,
+    NormalizeMode::Exact,
+];
+const STATUS_OPTIONS: &[StatusFamily] = &[
+    StatusFamily::All,
+    StatusFamily::X2xx,
+    StatusFamily::X3xx,
+    StatusFamily::X4xx,
+    StatusFamily::X5xx,
+];
+const SORT_OPTIONS: &[ApiSortKey] = &[
+    ApiSortKey::P95Ms,
+    ApiSortKey::P99Ms,
+    ApiSortKey::AvgMs,
+    ApiSortKey::MaxMs,
+    ApiSortKey::Count,
+    ApiSortKey::ErrorCount,
+    ApiSortKey::Path,
+];
+
+pub fn view(app: &App) -> Option<Element<'_, Message>> {
+    if !app.analysis.has_data {
+        return None;
+    }
+    let filters = &app.analysis.filters;
+    let active_count = count_active_analysis_filters(filters);
+    let methods = app
+        .analysis
+        .result
+        .as_ref()
+        .map(|r| r.methods.clone())
+        .unwrap_or_default();
+    let dates = app
+        .analysis
+        .result
+        .as_ref()
+        .map(|r| r.dates.clone())
+        .unwrap_or_default();
     let all_selected = filters.methods.is_empty();
 
-    let apply = move |updated: AnalysisFilters, refresh: bool| {
-        set_filters(store, updated);
-        if refresh {
-            reaggregate(store);
-        }
-    };
+    let search = text_input("Filter endpoints… (/)", &filters.query)
+        .id(iced::widget::Id::new(SEARCH_INPUT_ID))
+        .on_input(Message::QueryChanged)
+        .padding(FIELD_PADDING)
+        .size(12)
+        .line_height(iced::Pixels(crate::ui::lh::TEXT_XS))
+        .style(style::field);
+    let normalize = pick_list(
+        NORMALIZE_OPTIONS,
+        Some(filters.normalize_mode),
+        Message::NormalizeChanged,
+    )
+    .padding(FIELD_PADDING)
+    .text_size(12)
+    .text_line_height(iced::Pixels(crate::ui::lh::TEXT_XS))
+    .style(style::picker);
+    let status = pick_list(
+        STATUS_OPTIONS,
+        Some(filters.status_family),
+        Message::StatusChanged,
+    )
+    .padding(FIELD_PADDING)
+    .text_size(12)
+    .text_line_height(iced::Pixels(crate::ui::lh::TEXT_XS))
+    .style(style::picker);
+    let min_ms = text_input("", &app.min_ms_input)
+        .on_input(Message::MinMsChanged)
+        .padding(FIELD_PADDING)
+        .size(12)
+        .line_height(iced::Pixels(crate::ui::lh::TEXT_XS))
+        .width(Length::Fixed(80.0))
+        .style(style::field);
+    let sort = pick_list(SORT_OPTIONS, Some(filters.sort_key), Message::ApiSortKeyChanged)
+        .padding(FIELD_PADDING)
+        .text_size(12)
+        .text_line_height(iced::Pixels(crate::ui::lh::TEXT_XS))
+        .style(style::picker);
+    let top_n = text_input("", &app.top_n_input)
+        .on_input(Message::TopNChanged)
+        .padding(FIELD_PADDING)
+        .size(12)
+        .line_height(iced::Pixels(crate::ui::lh::TEXT_XS))
+        .width(Length::Fixed(80.0))
+        .style(style::field);
 
-    rsx! {
-        section {
-            "data-ui-id": "filter-bar",
-            class: "rounded border border-slate-200 bg-white px-3 py-3 dark:border-slate-800 dark:bg-slate-900",
-            div { class: "flex flex-wrap items-end gap-3",
-                label { class: "block min-w-[14rem] flex-1",
-                    span { class: "mb-1 block text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400",
-                        "Search"
-                    }
-                    input {
-                        "data-filter-search": "true",
-                        r#type: "search",
-                        value: "{filters.query}",
-                        oninput: move |e: Event<FormData>| {
-                            let mut f = store.filters();
-                            f.query = e.value();
-                            apply(f, false);
-                        },
-                        placeholder: "Filter endpoints… (/)",
-                        class: cn(&[FIELD_CLASS, "w-full"]),
-                    }
-                }
-                label { class: "block",
-                    span { class: "mb-1 block text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400",
-                        "Normalize"
-                    }
-                    select {
-                        value: "{filters.normalize_mode.key()}",
-                        onchange: move |e: Event<FormData>| {
-                            if let Some(mode) = NormalizeMode::from_key(&e.value()) {
-                                let mut f = store.filters();
-                                f.normalize_mode = mode;
-                                apply(f, true);
-                            }
-                        },
-                        class: "{FIELD_CLASS}",
-                        option { value: "collapseIds", "Collapse IDs" }
-                        option { value: "stripQuery", "Strip query" }
-                        option { value: "exact", "Exact path" }
-                    }
-                }
-                label { class: "block",
-                    span { class: "mb-1 block text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400",
-                        "Status"
-                    }
-                    select {
-                        "data-testid": "filter-status",
-                        value: "{filters.status_family.key()}",
-                        onchange: move |e: Event<FormData>| {
-                            if let Some(family) = StatusFamily::from_key(&e.value()) {
-                                let mut f = store.filters();
-                                f.status_family = family;
-                                apply(f, true);
-                            }
-                        },
-                        class: "{FIELD_CLASS}",
-                        option { value: "all", "All" }
-                        option { value: "2xx", "2xx" }
-                        option { value: "3xx", "3xx" }
-                        option { value: "4xx", "4xx" }
-                        option { value: "5xx", "5xx" }
-                    }
-                }
-                label { class: "block",
-                    span { class: "mb-1 block text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400",
-                        "Min ms"
-                    }
-                    input {
-                        "data-testid": "filter-min-ms",
-                        r#type: "number",
-                        min: "0",
-                        value: "{fmt_min_ms(filters.min_ms)}",
-                        oninput: move |e: Event<FormData>| {
-                            let mut f = store.filters();
-                            f.min_ms = e.value().parse::<f64>().unwrap_or(0.0).max(0.0);
-                            apply(f, true);
-                        },
-                        class: cn(&[FIELD_CLASS, "w-20"]),
-                    }
-                }
-                label { class: "block",
-                    span { class: "mb-1 block text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400",
-                        "Sort"
-                    }
-                    select {
-                        value: "{api_sort_key_str(filters.sort_key)}",
-                        onchange: move |e: Event<FormData>| {
-                            if let Some(key) = parse_api_sort_key(&e.value()) {
-                                let mut f = store.filters();
-                                f.sort_key = key;
-                                apply(f, false);
-                            }
-                        },
-                        class: "{FIELD_CLASS}",
-                        option { value: "p95Ms", "p95" }
-                        option { value: "p99Ms", "p99" }
-                        option { value: "avgMs", "avg" }
-                        option { value: "maxMs", "max" }
-                        option { value: "count", "count" }
-                        option { value: "errorCount", "errors" }
-                        option { value: "path", "endpoint" }
-                    }
-                }
-                label { class: "block",
-                    span { class: "mb-1 block text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400",
-                        "Top N"
-                    }
-                    input {
-                        r#type: "number",
-                        min: "1",
-                        max: "500",
-                        value: "{filters.top_n}",
-                        oninput: move |e: Event<FormData>| {
-                            let mut f = store.filters();
-                            f.top_n = e
-                                .value()
-                                .parse::<usize>()
-                                .unwrap_or(50)
-                                .clamp(1, 500);
-                            apply(f, false);
-                        },
-                        class: cn(&[FIELD_CLASS, "w-20"]),
-                    }
-                }
-                div { class: "ml-auto flex items-center",
-                    button {
-                        r#type: "button",
-                        "data-testid": "pm2-reset-filters",
-                        disabled: active_count == 0,
-                        onclick: move |_| reset_filters(store),
-                        class: cn(&[
-                            "flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-semibold transition-all cursor-pointer",
-                            if active_count > 0 {
-                                "border border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100 hover:text-rose-800 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300 dark:hover:bg-rose-900/60"
-                            } else {
-                                "border border-transparent text-slate-400 opacity-40 cursor-not-allowed dark:text-slate-500"
-                            },
-                        ]),
-                        title: if active_count > 0 { "Reset all filters to defaults" } else { "No active filters to reset" },
-                        Icon18 { name: "rotate-ccw" }
-                        span { "Reset all filters" }
-                        if active_count > 0 {
-                            span { class: "rounded-full bg-rose-200/80 px-1.5 py-0.2 text-[10px] font-bold text-rose-800 dark:bg-rose-900 dark:text-rose-200",
-                                "{active_count}"
-                            }
-                        }
-                    }
-                }
-            }
+    let reset = reset_button(active_count);
 
-            if dates.len() > 1 || !methods.is_empty() {
-                div { class: "mt-2.5 flex flex-wrap items-center gap-3",
-                    if dates.len() > 1 {
-                        div {
-                            "data-testid": "filter-date",
-                            class: "flex flex-wrap items-center gap-1.5",
-                            span { class: "mr-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400",
-                                "Day"
-                            }
-                            button {
-                                r#type: "button",
-                                onclick: move |_| {
-                                    let mut f = store.filters();
-                                    f.date_filter = "all".to_string();
-                                    apply(f, true);
-                                },
-                                class: cn(&[
-                                    "rounded px-2 py-0.5 text-[10px] font-medium tracking-wide ring-1 transition-colors cursor-pointer border-0",
-                                    if filters.date_filter == "all" {
-                                        "bg-blue-50 text-blue-700 ring-blue-200 dark:bg-blue-950/60 dark:text-blue-300 dark:ring-blue-800"
-                                    } else {
-                                        "bg-slate-50 text-slate-500 ring-slate-200 hover:bg-slate-100 dark:bg-slate-800/60 dark:text-slate-400 dark:ring-slate-700 dark:hover:bg-slate-800"
-                                    },
-                                ]),
-                                "All Days ({dates.len()})"
-                            }
-                            for date in dates.iter() {
-                                {
-                                    let d = date.clone();
-                                    let d_for_key = d.clone();
-                                    let active = filters.date_filter == *date;
-                                    rsx! {
-                                        button {
-                                            key: "{d_for_key}",
-                                            r#type: "button",
-                                            onclick: move |_| {
-                                                let mut f = store.filters();
-                                                f.date_filter = d.clone();
-                                                apply(f, true);
-                                            },
-                                            class: cn(&[
-                                                "rounded px-2 py-0.5 font-mono-data text-[10px] tracking-wide ring-1 transition-colors cursor-pointer border-0",
-                                                if active {
-                                                    "bg-blue-50 text-blue-700 ring-blue-200 dark:bg-blue-950/60 dark:text-blue-300 dark:ring-blue-800"
-                                                } else {
-                                                    "bg-slate-50 text-slate-500 ring-slate-200 hover:bg-slate-100 dark:bg-slate-800/60 dark:text-slate-400 dark:ring-slate-700 dark:hover:bg-slate-800"
-                                                },
-                                            ]),
-                                            "{format_date(Some(&d))}"
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if dates.len() > 1 && !methods.is_empty() {
-                        div { class: "hidden h-4 w-px bg-slate-200 sm:block dark:bg-slate-700" }
-                    }
-                    if !methods.is_empty() {
-                        div { class: "flex flex-wrap items-center gap-1.5",
-                            span { class: "mr-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400",
-                                "Methods"
-                            }
-                            MethodChip { label: "All".to_string(), method: None, all_selected }
-                            for method in methods.iter() {
-                                MethodChip {
-                                    key: "{method}",
-                                    label: method.clone(),
-                                    method: Some(method.clone()),
-                                    all_selected,
-                                }
-                            }
-                            if !all_selected {
-                                button {
-                                    r#type: "button",
-                                    onclick: move |_| {
-                                        let mut f = store.filters();
-                                        f.methods = Vec::new();
-                                        apply(f, false);
-                                    },
-                                    class: "text-[11px] text-slate-500 underline-offset-2 hover:underline dark:text-slate-400 cursor-pointer border-0 bg-transparent",
-                                    "Reset"
-                                }
-                            }
-                        }
-                    }
-                }
+    let controls = row![
+        field("SEARCH", search.into(), Fill),
+        field("NORMALIZE", normalize.into(), Length::Shrink),
+        field("STATUS", status.into(), Length::Shrink),
+        field("MIN MS", min_ms.into(), Length::Shrink),
+        field("SORT", sort.into(), Length::Shrink),
+        field("TOP N", top_n.into(), Length::Shrink),
+        container(reset).padding(iced::Padding {
+            top: 0.0,
+            right: 0.0,
+            bottom: 1.0,
+            left: 0.0,
+        }),
+    ]
+    .spacing(12)
+    .align_y(iced::Bottom)
+    .width(Fill);
+
+    let mut content = column![controls].spacing(12).width(Fill);
+
+    if dates.len() > 1 || !methods.is_empty() {
+        let mut meta = row![].spacing(12).align_y(Center);
+
+        if dates.len() > 1 {
+            meta = meta.push(
+                row![
+                    crate::ui::lined_styled(
+                        "DAY",
+                        10.0,
+                        style::SEMIBOLD,
+                        crate::ui::lh::TEXT_10,
+                        style::text_muted,
+                    ),
+                    chip(
+                        format!("All Days ({})", dates.len()),
+                        filters.date_filter == "all",
+                        style::MEDIUM,
+                        Message::DateFilterChanged("all".to_string()),
+                    ),
+                ]
+                .spacing(6)
+                .align_y(Center),
+            );
+            for date in &dates {
+                meta = meta.push(chip(
+                    format_date(Some(date)),
+                    filters.date_filter == *date,
+                    style::MONO,
+                    Message::DateFilterChanged(date.clone()),
+                ));
             }
         }
+
+        if dates.len() > 1 && !methods.is_empty() {
+            meta = meta.push(
+                container(space().width(1.0))
+                    .width(1.0)
+                    .height(Length::Fixed(16.0))
+                    .style(style::divider),
+            );
+        }
+
+        if !methods.is_empty() {
+            let mut method_row = row![
+                crate::ui::lined_styled(
+                    "METHODS",
+                    10.0,
+                    style::SEMIBOLD,
+                    crate::ui::lh::TEXT_10,
+                    style::text_muted,
+                ),
+                chip(
+                    "All".to_string(),
+                    all_selected,
+                    style::BOLD,
+                    Message::MethodChipToggled(None)
+                ),
+            ]
+            .spacing(6)
+            .align_y(Center);
+            for method in &methods {
+                method_row = method_row.push(chip(
+                    method.clone(),
+                    all_selected || filters.methods.iter().any(|m| m == method),
+                    style::BOLD,
+                    Message::MethodChipToggled(Some(method.clone())),
+                ));
+            }
+            if !all_selected {
+                method_row = method_row.push(
+                    button(text("Reset").size(11).style(style::text_muted))
+                        .on_press(Message::MethodChipToggled(None))
+                        .padding(0)
+                        .style(style::btn_ghost),
+                );
+            }
+            meta = meta.push(method_row);
+        }
+
+        content = content.push(meta);
     }
+
+    Some(
+        container(content)
+            .width(Fill)
+            .padding(Padding {
+                top: 12.0,
+                right: 12.0,
+                bottom: 12.0,
+                left: 12.0,
+            })
+            .style(style::card)
+            .into(),
+    )
 }
 
-fn fmt_min_ms(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{}", value as i64)
-    } else {
-        format!("{value}")
-    }
+fn field<'a>(
+    label: &'static str,
+    control: Element<'a, Message>,
+    width: Length,
+) -> Column<'a, Message> {
+    column![
+        crate::ui::lined_styled(
+            label,
+            10.0,
+            style::SEMIBOLD,
+            crate::ui::lh::TEXT_10,
+            style::text_muted,
+        ),
+        control,
+    ]
+    .spacing(4)
+    .width(width)
 }
 
-fn api_sort_key_str(key: ApiSortKey) -> &'static str {
-    match key {
-        ApiSortKey::P95Ms => "p95Ms",
-        ApiSortKey::P99Ms => "p99Ms",
-        ApiSortKey::AvgMs => "avgMs",
-        ApiSortKey::MaxMs => "maxMs",
-        ApiSortKey::Count => "count",
-        ApiSortKey::ErrorCount => "errorCount",
-        ApiSortKey::Path => "path",
+fn reset_button(active_count: usize) -> Element<'static, Message> {
+    let mut content = row![icons::icon(
+        "rotate-ccw",
+        12.0,
+        if active_count > 0 {
+            style::ROSE_700
+        } else {
+            style::SLATE_400
+        }
+    )]
+    .spacing(6)
+    .align_y(Center);
+    content = content.push(text("Reset all filters").size(12).font(style::SEMIBOLD));
+    if active_count > 0 {
+        content = content.push(
+            container(text(active_count.to_string()).size(10).font(style::BOLD))
+                .padding([1, 6])
+                .style(style::reset_count),
+        );
     }
+
+    button(content)
+        .on_press_maybe((active_count > 0).then_some(Message::ResetFilters))
+        .padding([6, 10])
+        .style(style::reset_chip(active_count > 0))
+        .into()
 }
 
-fn parse_api_sort_key(value: &str) -> Option<ApiSortKey> {
-    match value {
-        "p95Ms" => Some(ApiSortKey::P95Ms),
-        "p99Ms" => Some(ApiSortKey::P99Ms),
-        "avgMs" => Some(ApiSortKey::AvgMs),
-        "maxMs" => Some(ApiSortKey::MaxMs),
-        "count" => Some(ApiSortKey::Count),
-        "errorCount" => Some(ApiSortKey::ErrorCount),
-        "path" => Some(ApiSortKey::Path),
-        _ => None,
-    }
-}
-
-#[component]
-fn Icon18(name: String) -> Element {
-    rsx! {
-        crate::ui::icons::Icon { name, class: "size-3" }
-    }
-}
-
-#[component]
-fn MethodChip(
+fn chip(
     label: String,
-    method: Option<String>,
-    all_selected: bool,
-) -> Element {
-    let store = use_analysis_store();
-    let is_selected = method
-        .as_deref()
-        .map(|m| store.filters().methods.iter().any(|x| x == m))
-        .unwrap_or(false);
-    let active = all_selected || is_selected;
-    let method_for_click = method.clone();
-    rsx! {
-        button {
-            r#type: "button",
-            onclick: move |_| {
-                let mut f = store.filters();
-                match &method_for_click {
-                    None => f.methods = Vec::new(),
-                    Some(m) => {
-                        if all_selected {
-                            f.methods = vec![m.clone()];
-                        } else if f.methods.iter().any(|x| x == m) {
-                            f.methods.retain(|x| x != m);
-                        } else {
-                            f.methods.push(m.clone());
-                        }
-                    }
-                }
-                set_filters(store, f);
-            },
-            class: cn(&[
-                "rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ring-1 transition-colors cursor-pointer border-0",
-                if active {
-                    "bg-blue-50 text-blue-700 ring-blue-200 dark:bg-blue-950/60 dark:text-blue-300 dark:ring-blue-800"
-                } else {
-                    "bg-slate-50 text-slate-400 ring-slate-200 dark:bg-slate-800/60 dark:text-slate-400 dark:ring-slate-700"
-                },
-            ]),
-            "{label}"
-        }
-    }
-}
+    active: bool,
+    font: iced::Font,
+    on_press: Message,
+) -> Element<'static, Message> {
+    let content = container(
+        container(text(label).size(10).font(font))
+            .height(Length::Fixed(crate::ui::lh::TEXT_10)),
+    )
+    .padding(Padding {
+        top: 2.0,
+        right: 8.0,
+        bottom: 2.0,
+        left: 8.0,
+    })
+    .style(style::chip(active));
 
-pub const _SORT_DIR_UNUSED: SortDirection = SortDirection::Desc;
+    button(content)
+        .on_press(on_press)
+        .padding(0)
+        .style(style::transparent_button)
+        .into()
+}
