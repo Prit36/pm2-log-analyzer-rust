@@ -1,29 +1,40 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use iced::window;
-use iced::Size;
+use pm2_log_analyzer::egui_app::EguiApp;
 
-use pm2_log_analyzer::app::App;
-
-fn main() -> iced::Result {
-    let window = window::Settings {
-        size: Size::new(1280.0, 850.0),
-        min_size: Some(Size::new(900.0, 600.0)),
-        resizable: true,
-        ..window::Settings::default()
-    };
-
-    let mut app = iced::application(App::boot, App::update, App::view)
-        .title(App::title)
-        .theme(App::theme)
-        .subscription(App::subscription)
-        .style(App::style)
-        .default_font(pm2_log_analyzer::ui::style::REGULAR)
-        .window(window);
-
-    for face in pm2_log_analyzer::ui::fonts::FILES {
-        app = app.font(face);
+fn capture_window_size() -> [f32; 2] {
+    let capture_mode = std::env::var_os("PM2_CAPTURE_SCREENSHOT").is_some()
+        || std::env::var_os("PM2_CAPTURE_MONGO_SCREENSHOT").is_some();
+    if !capture_mode {
+        return [1280.0, 850.0];
     }
 
-    app.run()
+    let dimension = |name: &str, default: f32| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(default)
+    };
+
+    [
+        dimension("PM2_CAPTURE_WIDTH", 1280.0),
+        dimension("PM2_CAPTURE_HEIGHT", 850.0),
+    ]
+}
+
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(capture_window_size())
+            .with_min_inner_size([900.0, 600.0])
+            .with_title("PM2 Log Analyzer"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "PM2 Log Analyzer",
+        options,
+        Box::new(|cc| Ok(Box::new(EguiApp::new(cc)))),
+    )
 }

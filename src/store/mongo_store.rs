@@ -108,6 +108,7 @@ pub struct MongoState {
     pub active_slow_query: Option<MongoSlowQuery>,
     pub active_user_detail: Option<MongoUserActivity>,
     pub active_view: MongoActiveView,
+    pub chart_mode: MongoChartMode,
     pub diag_tab: MongoDiagTab,
     /// Local `MongoUserActivityPanel` search box.
     pub user_search: String,
@@ -133,6 +134,7 @@ impl Default for MongoState {
             active_slow_query: None,
             active_user_detail: None,
             active_view: MongoActiveView::default(),
+            chart_mode: MongoChartMode::default(),
             diag_tab: MongoDiagTab::default(),
             user_search: String::new(),
         }
